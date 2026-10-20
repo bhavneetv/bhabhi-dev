@@ -749,34 +749,51 @@ export const App: React.FC = () => {
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
 
-  // Compute table percentage coordinates for each player seat
-  const getPlayerSeatCoords = useCallback(
-    (playerId: string): { left: number; top: number } => {
-      if (playerId === localPlayer.id) {
-        return { left: 50, top: 88 };
-      }
-      const list = playersRef.current.length > 0 ? playersRef.current : players;
-      const opponents = list.filter((p) => p.id !== localPlayer.id);
-      const oppIndex = opponents.findIndex((p) => p.id === playerId);
-      if (oppIndex === -1) {
-        return { left: 50, top: 18 };
-      }
+// Arrange opponents in consistent clockwise seating order relative to local player
+const getClockwiseOpponents = (allPlayers: Player[], localId: string): Player[] => {
+  const localIndex = allPlayers.findIndex((p) => p.id === localId);
+  if (localIndex === -1) {
+    return allPlayers.filter((p) => p.id !== localId);
+  }
+  const n = allPlayers.length;
+  const ordered: Player[] = [];
+  for (let step = 1; step < n; step++) {
+    const opp = allPlayers[(localIndex + step) % n];
+    if (opp && opp.id !== localId) {
+      ordered.push(opp);
+    }
+  }
+  return ordered;
+};
 
-      const count = opponents.length;
-      const arcStart = 200;
-      const arcEnd = -20;
-      const step = count > 1 ? (arcStart - arcEnd) / (count - 1) : 0;
-      const currentAngleDeg = count === 1 ? 90 : arcStart - oppIndex * step;
-      const currentAngleRad = (currentAngleDeg * Math.PI) / 180;
-      const radiusX = 43;
-      const radiusY = 38;
-      const leftPct = 50 + radiusX * Math.cos(currentAngleRad);
-      const topPct = 50 - radiusY * Math.sin(currentAngleRad);
+// Compute table percentage coordinates for each player seat in guaranteed clockwise sequence
+const getPlayerSeatCoords = useCallback(
+  (playerId: string): { left: number; top: number } => {
+    if (playerId === localPlayer.id) {
+      return { left: 50, top: 88 };
+    }
+    const list = playersRef.current.length > 0 ? playersRef.current : players;
+    const opponents = getClockwiseOpponents(list, localPlayer.id);
+    const oppIndex = opponents.findIndex((p) => p.id === playerId);
+    if (oppIndex === -1) {
+      return { left: 50, top: 18 };
+    }
 
-      return { left: leftPct, top: topPct };
-    },
-    [players, localPlayer.id]
-  );
+    const count = opponents.length;
+    const arcStart = 200;
+    const arcEnd = -20;
+    const step = count > 1 ? (arcStart - arcEnd) / (count - 1) : 0;
+    const currentAngleDeg = count === 1 ? 90 : arcStart - oppIndex * step;
+    const currentAngleRad = (currentAngleDeg * Math.PI) / 180;
+    const radiusX = 43;
+    const radiusY = 38;
+    const leftPct = 50 + radiusX * Math.cos(currentAngleRad);
+    const topPct = 50 - radiusY * Math.sin(currentAngleRad);
+
+    return { left: leftPct, top: topPct };
+  },
+  [players, localPlayer.id]
+);
 
   // Keyboard shortcut listener ('F' for Fullscreen)
   useEffect(() => {
@@ -2501,10 +2518,8 @@ export const App: React.FC = () => {
                 onManualReconnect={() => multiplayerService.reconnect()}
               />
 
-              {/* OPPONENTS AROUND THE ELLIPSE */}
-              {players
-                .filter((p) => p.id !== localPlayer.id)
-                .map((opp, oppIndex, oppArr) => {
+              {/* OPPONENTS AROUND THE ELLIPSE IN GUARANTEED CLOCKWISE SEQUENCE */}
+              {getClockwiseOpponents(players, localPlayer.id).map((opp, oppIndex, oppArr) => {
                   const count = oppArr.length;
                   const arcStart = 200;
                   const arcEnd = -20;
