@@ -29,6 +29,7 @@ interface TableCenterProps {
   thullaBanner?: ThullaBannerInfo | null;
   cleanBanner?: CleanBannerInfo | null;
   isDiscarding?: boolean;
+  flyingCardIds?: Set<string>;
 }
 
 export const TableCenter: React.FC<TableCenterProps> = ({
@@ -38,15 +39,30 @@ export const TableCenter: React.FC<TableCenterProps> = ({
   manualPickupRequired = false,
   onManualPickup,
   pickerName,
+  cleanBanner,
   isDiscarding = false,
+  flyingCardIds,
 }) => {
   const getPlayer = (id: string) => players.find((p) => p.id === id);
 
+  // Cards currently flying in the air MUST NOT be rendered on the table felt prematurely
+  const visiblePlays = flyingCardIds && flyingCardIds.size > 0
+    ? trick.plays.filter((p) => !flyingCardIds.has(p.card.id))
+    : trick.plays;
+
   return (
     <div className="relative flex flex-col items-center justify-center w-full h-full min-h-[180px] sm:min-h-[250px] pointer-events-auto">
+      {/* Clean Trick Winner Banner */}
+      {cleanBanner && (
+        <div className="absolute -top-4 z-40 px-4 py-1.5 rounded-full bg-emerald-950/95 border border-emerald-400/70 shadow-2xl backdrop-blur-md flex items-center gap-2 animate-bounce text-emerald-200 text-xs sm:text-sm font-black">
+          <span>✨</span>
+          <span>{cleanBanner.winnerName} takes the trick!</span>
+        </div>
+      )}
+
       {/* Center Trick Played Cards Fan (with Discard Sweep Animation) */}
       <div className={`relative flex items-center justify-center w-full h-40 ${isDiscarding ? 'animate-discard-sweep' : ''}`}>
-        {trick.plays.length === 0 ? (
+        {visiblePlays.length === 0 ? (
           <div className="flex flex-col items-center justify-center opacity-30 select-none">
             <div className="w-10 h-10 rounded-full border border-dashed border-white/25 flex items-center justify-center">
               <Sparkles className="w-4 h-4 text-amber-300/80 animate-pulse" />
@@ -54,9 +70,9 @@ export const TableCenter: React.FC<TableCenterProps> = ({
           </div>
         ) : (
           <div className="relative flex items-center justify-center">
-            {trick.plays.map((play, index) => {
+            {visiblePlays.map((play, index) => {
               const player = getPlayer(play.playerId);
-              const total = trick.plays.length;
+              const total = visiblePlays.length;
               const angle = total > 1 ? (index - (total - 1) / 2) * 14 : 0;
               const xOffset = total > 1 ? (index - (total - 1) / 2) * 28 : 0;
               const yOffset = total > 1 ? Math.abs(index - (total - 1) / 2) * 4 : 0;

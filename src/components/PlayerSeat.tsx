@@ -1,7 +1,7 @@
 import React from 'react';
 import type { Player, Theme } from '../types/game';
 import { CardView } from './CardView';
-import { Crown, Bot, AlertTriangle, CheckCircle, Volume2 } from 'lucide-react';
+import { Crown, Bot, AlertTriangle, CheckCircle, Volume2, Wifi, WifiOff } from 'lucide-react';
 
 interface PlayerSeatProps {
   player: Player;
@@ -212,9 +212,49 @@ export const PlayerSeat: React.FC<PlayerSeatProps> = ({
           {canRename && <span className="text-[9px] opacity-70">✎</span>}
         </div>
 
+        {/* WiFi Signal Strength Indicator */}
+        <div
+          className={`mt-1 flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-mono font-bold tracking-tight border backdrop-blur-sm shadow-sm transition-all duration-300 ${
+            player.isOnline === false
+              ? 'bg-rose-950/80 border-rose-500/50 text-rose-400'
+              : (player.ping ?? 25) < 100
+              ? 'bg-slate-900/80 border-emerald-500/30 text-emerald-400'
+              : (player.ping ?? 25) <= 250
+              ? 'bg-slate-900/80 border-amber-500/30 text-amber-400'
+              : 'bg-rose-950/80 border-rose-500/50 text-rose-400 animate-pulse'
+          }`}
+          title={
+            player.isOnline === false
+              ? 'Disconnected from server'
+              : `Signal Latency: ${player.ping ?? 25}ms (${
+                  (player.ping ?? 25) < 100 ? 'Good' : (player.ping ?? 25) <= 250 ? 'Fair' : 'Poor'
+                })`
+          }
+        >
+          {player.isOnline === false ? (
+            <>
+              <WifiOff className="w-2.5 h-2.5 text-rose-400" />
+              <span>OFFLINE</span>
+            </>
+          ) : (
+            <>
+              <Wifi
+                className={`w-2.5 h-2.5 ${
+                  (player.ping ?? 25) < 100
+                    ? 'text-emerald-400'
+                    : (player.ping ?? 25) <= 250
+                    ? 'text-amber-400'
+                    : 'text-rose-400 animate-bounce'
+                }`}
+              />
+              <span>{player.ping !== undefined ? `${player.ping}ms` : '24ms'}</span>
+            </>
+          )}
+        </div>
+
         {/* Player connection status or Turn Status */}
         {player.isOnline === false ? (
-          <span className="text-[9px] font-bold text-amber-400 uppercase tracking-wider animate-pulse mt-0.5">
+          <span className="text-[9px] font-bold text-rose-400 uppercase tracking-wider animate-pulse mt-0.5">
             Reconnecting...
           </span>
         ) : isCurrentTurn ? (

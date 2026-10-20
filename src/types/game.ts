@@ -28,6 +28,7 @@ export interface Player {
   isSpeaking?: boolean;
   isOnline?: boolean;
   consecutiveTimeouts: number;
+  ping?: number;
 }
 
 export interface TrickPlay {

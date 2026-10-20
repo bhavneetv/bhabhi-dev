@@ -38,6 +38,8 @@ import { HomeScreen } from './components/HomeScreen';
 import { TakeCardsModal } from './components/TakeCardsModal';
 import { TransferRequestModal, type TransferRequestInfo } from './components/TransferRequestModal';
 import { RenamePlayerModal } from './components/RenamePlayerModal';
+import { NetworkLagOverlay } from './components/NetworkLagOverlay';
+import { ThullaOverlay } from './components/ThullaOverlay';
 import { multiplayerService, type NetworkEvent } from './network/multiplayerSync';
 import {
   Volume2,
@@ -54,6 +56,8 @@ import {
   Layers,
   MoreVertical,
   ArrowLeftRight,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 
 const DEFAULT_SETTINGS: RoomSettings = {
@@ -243,6 +247,7 @@ export const App: React.FC = () => {
   const [playerName, setPlayerName] = useState<string>(getInitialPlayerName);
   const [playerAvatar, setPlayerAvatar] = useState<string>(getInitialPlayerAvatar);
   const [isOnlineConnected, setIsOnlineConnected] = useState<boolean>(false);
+  const [localPing, setLocalPing] = useState<number>(25);
   const [sortMode, setSortMode] = useState<SortMode>('suit');
   const [mobileLayoutMode, setMobileLayoutMode] = useState<'two-row' | 'single'>('two-row');
 
@@ -286,6 +291,7 @@ export const App: React.FC = () => {
 
   // Flying Cards Animation State
   const [flyingCards, setFlyingCards] = useState<FlyingCardItem[]>([]);
+  const flyingCardIds = useMemo(() => new Set(flyingCards.map((f) => f.card.id)), [flyingCards]);
   const [isAnimatingPlay, setIsAnimatingPlay] = useState<boolean>(false);
   const [isDiscardingTrick, setIsDiscardingTrick] = useState<boolean>(false);
 
@@ -530,31 +536,39 @@ export const App: React.FC = () => {
       finishPosition: null,
       consecutiveTimeouts: 0,
       isOnline: true,
+      ping: localPing,
     };
     setPlayers([me]);
     playersRef.current = [me];
     setGamePhase('LOBBY');
     showToast(`Joining room ${clean}...`);
+
+    multiplayerService.joinRoomOnServer(
+      clean,
+      { id: localPlayerId, name: me.name, avatar: me.avatar },
+      (res) => {
+        if (res && res.success && res.state) {
+          setPlayers(res.state.players);
+          playersRef.current = res.state.players;
+          if (res.state.gamePhase) setGamePhase(res.state.gamePhase);
+          if (res.state.currentTrick) setCurrentTrick(res.state.currentTrick);
+          if (res.state.currentTurnPlayerId) setCurrentTurnPlayerId(res.state.currentTurnPlayerId);
+        } else if (res && !res.success) {
+          showToast(res.error || 'Failed to join room');
+        }
+      }
+    );
   };
 
   const handleCreateRoom = () => {
-    const newCode = Math.random().toString(36).substring(2, 8).toUpperCase().replace(/0|O|1|I/g, 'X');
+    const fallbackCode = Math.random().toString(36).substring(2, 8).toUpperCase().replace(/0|O|1|I/g, 'X');
     try {
       sessionStorage.removeItem('bhabhi_stay_home');
       sessionStorage.removeItem('bhabhi_left_room');
     } catch {
       // ignore
     }
-    setRoomCode(newCode);
-    localStorage.setItem('bhabhi_room_code', newCode);
-    localStorage.setItem(`bhabhi_is_host_${newCode}`, 'true');
-    if (typeof window !== 'undefined') {
-      try {
-        window.history.pushState({}, '', `${window.location.pathname}?room=${newCode}`);
-      } catch {
-        // ignore
-      }
-    }
+
     const me: Player = {
       id: localPlayerId,
       name: playerName || 'Player (Host)',
@@ -568,11 +582,40 @@ export const App: React.FC = () => {
       finishPosition: null,
       consecutiveTimeouts: 0,
       isOnline: true,
+      ping: localPing,
     };
+    setRoomCode(fallbackCode);
+    localStorage.setItem('bhabhi_room_code', fallbackCode);
+    localStorage.setItem(`bhabhi_is_host_${fallbackCode}`, 'true');
+    if (typeof window !== 'undefined') {
+      try {
+        window.history.pushState({}, '', `${window.location.pathname}?room=${fallbackCode}`);
+      } catch {}
+    }
+
     setPlayers([me]);
     playersRef.current = [me];
     setGamePhase('LOBBY');
-    showToast(`Created room ${newCode}! Share the code with friends.`);
+
+    multiplayerService.createRoomOnServer(
+      { id: localPlayerId, name: me.name, avatar: me.avatar },
+      fallbackCode,
+      settings,
+      theme,
+      (res) => {
+        const finalCode = res?.success && res.roomCode ? res.roomCode : fallbackCode;
+        if (finalCode !== fallbackCode) {
+          setRoomCode(finalCode);
+          localStorage.setItem('bhabhi_room_code', finalCode);
+          localStorage.setItem(`bhabhi_is_host_${finalCode}`, 'true');
+        }
+        if (res?.state?.players) {
+          setPlayers(res.state.players);
+          playersRef.current = res.state.players;
+        }
+        showToast(`Created room ${finalCode}! Share the code with friends.`);
+      }
+    );
   };
 
   const handleSoloPractice = () => {
@@ -712,9 +755,12 @@ export const App: React.FC = () => {
       if (playerId === localPlayer.id) {
         return { left: 50, top: 88 };
       }
-      const opponents = players.filter((p) => p.id !== localPlayer.id);
+      const list = playersRef.current.length > 0 ? playersRef.current : players;
+      const opponents = list.filter((p) => p.id !== localPlayer.id);
       const oppIndex = opponents.findIndex((p) => p.id === playerId);
-      if (oppIndex === -1) return { left: 50, top: 50 };
+      if (oppIndex === -1) {
+        return { left: 50, top: 18 };
+      }
 
       const count = opponents.length;
       const arcStart = 200;
@@ -802,13 +848,25 @@ export const App: React.FC = () => {
         return;
       }
 
-      // Broadcast move to all connected players across the internet
+      // Broadcast move to all connected players across the internet & authoritative server
       if (shouldBroadcast) {
-        multiplayerService.broadcast({
-          type: 'PLAY_CARD',
-          playerId,
-          card,
-        });
+        if (multiplayerService.isServerConnected()) {
+          // Connected to authoritative server: send only via playCardOnServer for the local player
+          if (playerId === localPlayer.id) {
+            multiplayerService.playCardOnServer(card.id, (ack) => {
+              if (ack && !ack.success && ack.error) {
+                showToast(ack.error);
+              }
+            });
+          }
+        } else {
+          // Offline fallback mode across tabs
+          multiplayerService.broadcast({
+            type: 'PLAY_CARD',
+            playerId,
+            card,
+          });
+        }
       }
 
       setIsAnimatingPlay(true);
@@ -821,15 +879,11 @@ export const App: React.FC = () => {
       const isLead = !currentTrick.leadSuit;
       const isThulla = !isLead && card.suit !== currentTrick.leadSuit;
 
-      if (isThulla) {
-        soundSynth.playDiscardSwoosh();
-      } else {
-        soundSynth.playCardDeal();
-      }
+      // Single sound design: No sound during rotation; only play card impact sound when card lands on table!
 
-      // Launch flying card animation: when Thulla, card spins dramatically in mid-air as it moves to table!
-      const flightDuration = isThulla ? 850 : 550;
-      const flyingId = `flight-${Date.now()}`;
+      // Launch flying card animation with weighted, smooth, clearly visible motion
+      const flightDuration = isThulla ? 1250 : 850;
+      const flyingId = `flight-${card.id}-${Date.now()}`;
       setFlyingCards((prev) => [
         ...prev,
         {
@@ -904,7 +958,6 @@ export const App: React.FC = () => {
           };
           setThullaBanner(bannerInfo);
 
-          soundSynth.playThullaBoom();
           addChatMessage(
             `💥 THULLA! ${player.name} cut with ${card.rank} of ${card.suit}! ${picker?.name} takes ${pickedCards.length} cards!`,
             player,
@@ -1359,9 +1412,161 @@ export const App: React.FC = () => {
           break;
         }
 
+        case 'CARD_PLAYED_ANIMATION': {
+          if (event.playerId !== localPlayerId) {
+            // 1. Visually remove the card from the opponent's hand immediately
+            setPlayers((prev) =>
+              prev.map((p) => {
+                if (p.id === event.playerId) {
+                  const updatedCards = p.cards ? p.cards.filter((c) => c.id !== event.card.id) : [];
+                  const newCount = typeof event.remainingCards === 'number'
+                    ? event.remainingCards
+                    : Math.max(0, (p.cardCount || p.cards.length) - 1);
+                  return {
+                    ...p,
+                    cards: updatedCards,
+                    cardCount: newCount,
+                  };
+                }
+                return p;
+              })
+            );
+
+            // 2. Launch smooth flight animation from opponent seat to table center
+            const fromCoords = getPlayerSeatCoords(event.playerId);
+            const toCoords = { left: 50, top: 48 };
+            const flightDuration = event.isThulla ? 1250 : 850;
+            const flyingId = `flight-${event.card.id}-${Date.now()}`;
+
+            setFlyingCards((prev) => [
+              ...prev.filter((f) => f.card.id !== event.card.id),
+              {
+                id: flyingId,
+                card: event.card,
+                from: fromCoords,
+                to: toCoords,
+                durationMs: flightDuration,
+                startRotation: 0,
+                endRotation: event.isThulla ? 1080 : Math.floor(Math.random() * 20 - 10),
+                isThulla: event.isThulla,
+              },
+            ]);
+
+            // 3. Single sound guarantee: ONLY play card impact sound when it lands on table felt
+            setTimeout(() => {
+              if (event.isThulla) {
+                soundSynth.playThullaBoom();
+              } else {
+                soundSynth.playCardSnap();
+              }
+              setFlyingCards((fList) => fList.filter((f) => f.id !== flyingId));
+              setCurrentTrick(event.trick);
+            }, flightDuration);
+          } else {
+            // Local player: trick state is saved; TableCenter reveals the card on felt when flight lands!
+            setCurrentTrick(event.trick);
+          }
+          break;
+        }
+
+        case 'THULLA_ALERT': {
+          setCutterPlayerId(event.cutterId);
+          setPickerPlayerId(event.pickerId);
+          setThullaBanner({
+            cutterName: event.cutterName,
+            pickerName: event.pickerName,
+            cutCard: event.cutCard,
+            highestLeadCard: event.cutCard,
+            pickedCount: event.pickedCount,
+          });
+
+          // Single sound guarantee: cutter already triggered the boom locally upon card impact!
+          if (event.cutterId !== localPlayerId) {
+            soundSynth.playThullaBoom();
+          }
+
+          addChatMessage(
+            `💥 THULLA! ${event.cutterName} cut with ${event.cutCard.rank} of ${event.cutCard.suit}! ${event.pickerName} takes ${event.pickedCount} cards!`,
+            playersRef.current.find((p) => p.id === event.cutterId) || localPlayerRef.current,
+            true
+          );
+
+          // After displaying the banner, smoothly fly all table cards to the picker's seat
+          setTimeout(() => {
+            const pickerCoords = getPlayerSeatCoords(event.pickerId);
+            const currentPlays = currentTrickRef.current.plays;
+            if (currentPlays.length > 0) {
+              const pickupFlights: FlyingCardItem[] = currentPlays.map((p, pIdx) => ({
+                id: `pickup-${pIdx}-${Date.now()}`,
+                card: p.card,
+                from: { left: 50, top: 48 },
+                to: pickerCoords,
+                durationMs: 950,
+                startRotation: 0,
+                endRotation: 720 + pIdx * 90,
+              }));
+              setFlyingCards(pickupFlights);
+              setCurrentTrick({ leadSuit: null, plays: [] });
+
+              setTimeout(() => {
+                setFlyingCards([]);
+                soundSynth.playPickup();
+                setThullaBanner(null);
+                setCutterPlayerId(null);
+                setPickerPlayerId(null);
+              }, 950);
+            } else {
+              setThullaBanner(null);
+              setCutterPlayerId(null);
+              setPickerPlayerId(null);
+            }
+          }, 2000);
+          break;
+        }
+
+        case 'CLEAN_TRICK_ALERT': {
+          setCleanBanner({
+            winnerName: event.winnerName,
+            winningCard: currentTrickRef.current.plays[0]?.card || { id: 'w', suit: 'spades', rank: 'A', deckIndex: 0, value: 14 },
+          });
+          soundSynth.playDiscardSwoosh();
+          break;
+        }
+
+        case 'PLAYERS_OUT_ALERT': {
+          event.newlyOut.forEach((outP) => {
+            if (outP.finishPosition === 1) {
+              soundSynth.playVictory();
+              addChatMessage(`🏆 ${outP.name} is the 1st safe player (Dever)!`, outP, true);
+              showToast(`🏆 ${outP.name} is SAFE #1 (Dever)!`);
+            } else {
+              addChatMessage(`✅ ${outP.name} shed all cards and is SAFE #${outP.finishPosition}!`, outP, true);
+              showToast(`✅ ${outP.name} is SAFE #${outP.finishPosition}!`);
+            }
+          });
+          break;
+        }
+
+        case 'TURN_TIMER_TICK': {
+          setTurnTimeLeft(event.turnTimeLeft);
+          if (event.currentTurnPlayerId && event.currentTurnPlayerId !== currentTurnPlayerIdRef.current) {
+            setCurrentTurnPlayerId(event.currentTurnPlayerId);
+            currentTurnPlayerIdRef.current = event.currentTurnPlayerId;
+          }
+          break;
+        }
+
+        case 'PING_UPDATE': {
+          setPlayers((prev) =>
+            prev.map((p) => (p.id === event.playerId ? { ...p, ping: event.ping } : p))
+          );
+          break;
+        }
+
         case 'SYNC_FULL_STATE': {
-          // If this client is the room host, ignore incoming SYNC_FULL_STATE from others
-          if (isHostForRoom(roomCode)) return;
+          if (event.toast) {
+            showToast(event.toast);
+          }
           if (event.targetPlayerId && event.targetPlayerId !== localPlayerId) return;
 
           const incoming = event.state.players;
@@ -1369,18 +1574,20 @@ export const App: React.FC = () => {
 
           let updatedList: Player[] = incoming.map((p): Player => {
             if (p.id === localPlayerId) {
+              const currentLocalCards = playersRef.current.find((pl) => pl.id === localPlayerId)?.cards || [];
+              const serverCards = p.cards && p.cards.length > 0 ? p.cards : currentLocalCards;
               return {
                 ...p,
+                cards: serverCards,
                 name: playerName,
                 avatar: playerAvatar,
-                isHost: false,
                 isOnline: true,
+                ping: localPing,
               };
             }
-            return { ...p, isOnline: true };
+            return { ...p, isOnline: p.isOnline !== false };
           });
 
-          // Always ensure local player is preserved in the room!
           if (!hasLocal) {
             updatedList = [
               ...updatedList,
@@ -1389,7 +1596,7 @@ export const App: React.FC = () => {
                 name: playerName,
                 avatar: playerAvatar,
                 isBot: false,
-                cards: [],
+                cards: playersRef.current.find((pl) => pl.id === localPlayerId)?.cards || [],
                 seatIndex: updatedList.length,
                 isHost: false,
                 isReady: true,
@@ -1397,6 +1604,7 @@ export const App: React.FC = () => {
                 finishPosition: null,
                 consecutiveTimeouts: 0,
                 isOnline: true,
+                ping: localPing,
               },
             ];
           }
@@ -1412,10 +1620,14 @@ export const App: React.FC = () => {
           setIsFirstTrick(event.state.isFirstTrick ?? false);
           isFirstTrickRef.current = event.state.isFirstTrick ?? false;
 
-          if (event.state.gamePhase === 'PLAYING' && gamePhaseRef.current !== 'PLAYING') {
-            setGamePhase('PLAYING');
-            gamePhaseRef.current = 'PLAYING';
-            soundSynth.playCardDeal();
+          if (event.state.gamePhase && event.state.gamePhase !== gamePhaseRef.current) {
+            setGamePhase(event.state.gamePhase);
+            gamePhaseRef.current = event.state.gamePhase;
+            if (event.state.gamePhase === 'PLAYING') {
+              soundSynth.playCardDeal();
+            } else if (event.state.gamePhase === 'GAME_OVER') {
+              soundSynth.playVictory();
+            }
           }
           setSettings(event.state.settings);
           setTheme(event.state.theme);
@@ -1503,9 +1715,27 @@ export const App: React.FC = () => {
       finishPosition: null,
       consecutiveTimeouts: 0,
       isOnline: true,
+      ping: localPing,
+    });
+
+    const unsubPing = multiplayerService.onPingChange((p) => {
+      setLocalPing(p);
+      setPlayers((prev) =>
+        prev.map((pl) => (pl.id === localPlayerId ? { ...pl, ping: p } : pl))
+      );
     });
 
     const unsubConnect = multiplayerService.onConnect(() => {
+      multiplayerService.joinRoomOnServer(
+        roomCode,
+        { id: localPlayerId, name: playerName, avatar: playerAvatar },
+        (res) => {
+          if (res?.success && res.state) {
+            setPlayers(res.state.players);
+            if (res.state.gamePhase) setGamePhase(res.state.gamePhase);
+          }
+        }
+      );
       multiplayerService.broadcast({
         type: 'PLAYER_JOIN',
         player: cleanLocalPlayer(),
@@ -1570,10 +1800,11 @@ export const App: React.FC = () => {
       window.removeEventListener('visibilitychange', handleWakeOrFocus);
       window.removeEventListener('focus', handleWakeOrFocus);
       window.removeEventListener('online', handleWakeOrFocus);
+      unsubPing();
       unsubConnect();
       multiplayerService.disconnect();
     };
-  }, [roomCode, localPlayerId, playerName, playerAvatar, gamePhase !== 'HOME']);
+  }, [roomCode, localPlayerId, playerName, playerAvatar, gamePhase]);
 
   // Continuous sync & presence in Lobby:
   // - Host continuously broadcasts full state every 2.5s so any newly connected phone or guest is immediately synced.
@@ -1682,10 +1913,12 @@ export const App: React.FC = () => {
     executePlayCard(player.id, chosen, true);
   }, [isAnimatingPlay, players, currentTurnPlayerId, currentTrick, isFirstTrick, executePlayCard]);
 
-  // Bot Turn Automated Runner (ONLY RUN BY HOST in multiplayer room!)
+  // Bot Turn Automated Runner (ONLY RUN BY HOST in offline/peer fallback; server handles it when connected)
   useEffect(() => {
     if (gamePhase !== 'PLAYING' || isAnimatingPlay) return;
     if (!localPlayer.isHost) return;
+    // Authoritative server manages bot moves to eliminate race conditions and false "Not your turn!" toasts
+    if (multiplayerService.isServerConnected()) return;
 
     const currentPlayer = players.find((p) => p.id === currentTurnPlayerId);
     if (!currentPlayer || !currentPlayer.isBot || currentPlayer.isOut || currentPlayer.cards.length === 0) return;
@@ -2258,6 +2491,14 @@ export const App: React.FC = () => {
                 thullaBanner={thullaBanner}
                 cleanBanner={cleanBanner}
                 isDiscarding={isDiscardingTrick}
+                flyingCardIds={flyingCardIds}
+              />
+
+              {/* Big Centered WiFi Warning Overlay for High Ping / Connection Drops */}
+              <NetworkLagOverlay
+                ping={localPing}
+                isOnline={isOnlineConnected}
+                onManualReconnect={() => multiplayerService.reconnect()}
               />
 
               {/* OPPONENTS AROUND THE ELLIPSE */}
@@ -2375,10 +2616,49 @@ export const App: React.FC = () => {
             {/* Mobile Hand Overview & Sort UI (No Filters, Zero Scrollbar, 100% on Screen) */}
             {isMobile && !isHandHidden && cardCount > 0 && (
               <div className="flex items-center justify-between w-full max-w-md px-2.5 mb-1 select-none">
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-2">
                   <span className="text-[10px] font-black uppercase tracking-wider text-slate-300">
                     Your Hand ({cardCount})
                   </span>
+                  {/* Local Player Signal Strength Badge */}
+                  <div
+                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-mono font-bold tracking-tight border backdrop-blur-sm shadow-sm transition-all duration-300 ${
+                      !isOnlineConnected
+                        ? 'bg-rose-950/80 border-rose-500/50 text-rose-400'
+                        : localPing < 100
+                        ? 'bg-slate-900/80 border-emerald-500/30 text-emerald-400'
+                        : localPing <= 250
+                        ? 'bg-slate-900/80 border-amber-500/30 text-amber-400'
+                        : 'bg-rose-950/80 border-rose-500/50 text-rose-400 animate-pulse'
+                    }`}
+                    title={
+                      !isOnlineConnected
+                        ? 'Disconnected from server'
+                        : `Signal Latency: ${localPing}ms (${
+                            localPing < 100 ? 'Good' : localPing <= 250 ? 'Fair' : 'Poor'
+                          })`
+                    }
+                  >
+                    {!isOnlineConnected ? (
+                      <>
+                        <WifiOff className="w-2.5 h-2.5 text-rose-400" />
+                        <span>OFFLINE</span>
+                      </>
+                    ) : (
+                      <>
+                        <Wifi
+                          className={`w-2.5 h-2.5 ${
+                            localPing < 100
+                              ? 'text-emerald-400'
+                              : localPing <= 250
+                              ? 'text-amber-400'
+                              : 'text-rose-400 animate-bounce'
+                          }`}
+                        />
+                        <span>{localPing}ms</span>
+                      </>
+                    )}
+                  </div>
                   {cardCount > 6 && (
                     <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-bold">
                       All on Screen
@@ -2631,6 +2911,18 @@ export const App: React.FC = () => {
         onSendMessage={(txt) => addChatMessage(txt, localPlayer)}
         onClose={() => setShowChat(false)}
       />
+
+      {/* THULLA CINEMATIC CUT OVERLAY */}
+      {thullaBanner && (
+        <ThullaOverlay
+          cutterName={thullaBanner.cutterName}
+          pickerName={thullaBanner.pickerName}
+          cutCard={thullaBanner.cutCard}
+          highestLeadCard={thullaBanner.highestLeadCard}
+          pickedCount={thullaBanner.pickedCount}
+          onDismiss={() => setThullaBanner(null)}
+        />
+      )}
 
       {/* GAME OVER RESULTS MODAL */}
       {gamePhase === 'GAME_OVER' && (

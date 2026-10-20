@@ -21,12 +21,12 @@ export const ThullaOverlay: React.FC<ThullaOverlayProps> = ({
   onDismiss,
 }) => {
   useEffect(() => {
-    // Trigger epic cinematic sound and haptics
-    soundSynth.playThullaBoom();
+    // Trigger haptics without dual audio boom (boom is triggered upon card impact)
+    soundSynth.triggerHaptic([60, 40, 80]);
 
     const timer = setTimeout(() => {
       onDismiss();
-    }, 2200);
+    }, 2400);
 
     return () => clearTimeout(timer);
   }, [onDismiss]);

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
 import type { Card, Theme } from '../types/game';
 import { CardView } from './CardView';
 
@@ -26,7 +26,7 @@ export const FlyingCardOverlay: React.FC<FlyingCardOverlayProps> = ({
   fourColorSuits = false,
 }) => {
   return (
-    <div className="absolute inset-0 pointer-events-none z-40 overflow-hidden">
+    <div className="absolute inset-0 pointer-events-none z-40 overflow-visible">
       {flyingCards.map((item) => (
         <AnimatedCard
           key={item.id}
@@ -44,42 +44,58 @@ const AnimatedCard: React.FC<{
   theme: Theme;
   fourColorSuits: boolean;
 }> = ({ item, theme, fourColorSuits }) => {
-  const [hasStarted, setHasStarted] = useState(false);
-  const duration = item.durationMs || 350;
+  const cardRef = React.useRef<HTMLDivElement>(null);
+  const duration = item.durationMs || 850;
 
   useEffect(() => {
-    // Trigger transition on next paint
-    const raf = requestAnimationFrame(() => {
-      setHasStarted(true);
-    });
+    const el = cardRef.current;
+    if (!el) return;
 
-    const timer = setTimeout(() => {
+    const startRot = item.startRotation ?? (item.isThulla ? 0 : Math.floor(Math.random() * 20 - 10));
+    const endRot = item.endRotation ?? 0;
+    const startScale = item.isThulla ? 1.25 : 1.08;
+    const endScale = item.isThulla ? 1.05 : 0.95;
+
+    // Direct browser compositor Web Animations API: 100% reliable 60/120fps motion
+    const anim = el.animate(
+      [
+        {
+          left: `${item.from.left}%`,
+          top: `${item.from.top}%`,
+          transform: `translate(-50%, -50%) rotate(${startRot}deg) scale(${startScale})`,
+        },
+        {
+          left: `${item.to.left}%`,
+          top: `${item.to.top}%`,
+          transform: `translate(-50%, -50%) rotate(${endRot}deg) scale(${endScale})`,
+        },
+      ],
+      {
+        duration,
+        easing: 'cubic-bezier(0.18, 0.9, 0.32, 1)',
+        fill: 'forwards',
+      }
+    );
+
+    anim.onfinish = () => {
       item.onComplete?.();
-    }, duration);
+    };
 
     return () => {
-      cancelAnimationFrame(raf);
-      clearTimeout(timer);
+      try {
+        anim.cancel();
+      } catch {}
     };
-  }, [item, duration]);
-
-  const currentLeft = hasStarted ? item.to.left : item.from.left;
-  const currentTop = hasStarted ? item.to.top : item.from.top;
-  const currentRot = hasStarted
-    ? item.endRotation ?? 0
-    : item.startRotation ?? (item.isThulla ? 0 : Math.random() * 20 - 10);
-  const currentScale = item.isThulla
-    ? hasStarted ? 1.05 : 1.25
-    : hasStarted ? 0.95 : 1.1;
+  }, [item.id, duration]);
 
   return (
     <div
-      className="absolute -translate-x-1/2 -translate-y-1/2 will-change-transform"
+      ref={cardRef}
+      className="absolute will-change-transform"
       style={{
-        left: `${currentLeft}%`,
-        top: `${currentTop}%`,
-        transform: `translate(-50%, -50%) rotate(${currentRot}deg) scale(${currentScale})`,
-        transition: `left ${duration}ms cubic-bezier(0.22, 1, 0.36, 1), top ${duration}ms cubic-bezier(0.22, 1, 0.36, 1), transform ${duration}ms cubic-bezier(0.22, 1, 0.36, 1)`,
+        left: `${item.from.left}%`,
+        top: `${item.from.top}%`,
+        transform: `translate(-50%, -50%)`,
         zIndex: item.isThulla ? 80 : 60,
       }}
     >
