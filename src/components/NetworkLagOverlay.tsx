@@ -14,9 +14,26 @@ export const NetworkLagOverlay: React.FC<NetworkLagOverlayProps> = ({
 }) => {
   const [minimized, setMinimized] = useState(false);
 
-  // Triggers when disconnected OR ping is abnormally high (> 280ms)
-  const isHighPing = ping > 280;
-  const shouldShow = (!isOnline || isHighPing) && !minimized;
+  const isHighPing = ping > 320;
+
+  if (isOnline && isHighPing && !minimized) {
+    return (
+      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-40 pointer-events-auto flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/90 border border-amber-500/50 backdrop-blur-md shadow-lg text-xs font-mono text-amber-400">
+        <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+        <Wifi className="w-3.5 h-3.5" />
+        <span>High Latency: {ping}ms</span>
+        <button
+          onClick={() => setMinimized(true)}
+          className="text-slate-400 hover:text-white ml-1 p-0.5 rounded-full hover:bg-white/10 transition-colors"
+          title="Dismiss warning"
+        >
+          <X className="w-3 h-3" />
+        </button>
+      </div>
+    );
+  }
+
+  const shouldShow = !isOnline && !minimized;
 
   if (!shouldShow) return null;
 

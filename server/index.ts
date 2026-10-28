@@ -110,7 +110,16 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('PLAY_CARD', (data: { roomCode: string; playerId: string; cardId: string }, ack) => {
     try {
-      const result = roomManager.playCard(data.roomCode, data.playerId, data.cardId);
+      const result = roomManager.playCard(data.roomCode, data.playerId, data.cardId, socket.id);
+      ack?.(result);
+    } catch (err: any) {
+      ack?.({ success: false, error: err.message });
+    }
+  });
+
+  socket.on('RETURN_TO_LOBBY', (data: { roomCode: string; playerId: string }, ack) => {
+    try {
+      const result = roomManager.returnToLobby(data.roomCode, data.playerId);
       ack?.(result);
     } catch (err: any) {
       ack?.({ success: false, error: err.message });
@@ -138,6 +147,24 @@ io.on('connection', (socket: Socket) => {
   socket.on('RENAME_PLAYER', (data: { roomCode: string; playerId: string; newName: string }, ack) => {
     try {
       roomManager.renamePlayer(data.roomCode, data.playerId, data.newName);
+      ack?.({ success: true });
+    } catch (err: any) {
+      ack?.({ success: false, error: err.message });
+    }
+  });
+
+  socket.on('ADD_BOT', (data: { roomCode: string; playerId: string; difficulty?: 'easy' | 'medium' | 'hard' }, ack) => {
+    try {
+      roomManager.addBot(data.roomCode, data.playerId, data.difficulty);
+      ack?.({ success: true });
+    } catch (err: any) {
+      ack?.({ success: false, error: err.message });
+    }
+  });
+
+  socket.on('REMOVE_PLAYER', (data: { roomCode: string; playerId: string; targetPlayerId: string }, ack) => {
+    try {
+      roomManager.removePlayer(data.roomCode, data.playerId, data.targetPlayerId);
       ack?.({ success: true });
     } catch (err: any) {
       ack?.({ success: false, error: err.message });

@@ -1,6 +1,6 @@
 export type Suit = 'spades' | 'hearts' | 'diamonds' | 'clubs';
 export type Rank = '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '10' | 'J' | 'Q' | 'K' | 'A';
-export type SortMode = 'suit' | 'rank-desc' | 'rank-asc';
+export type SortMode = 'none' | 'suit' | 'rank-desc' | 'rank-asc';
 
 export interface Card {
   id: string; // e.g., '0-spades-A'

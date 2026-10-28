@@ -7,6 +7,7 @@ interface TakeCardsModalProps {
   onClose: () => void;
   players: Player[];
   localPlayer: Player;
+  isMyTurn?: boolean;
   onGiveCards: (targetPlayer: Player) => void;
   onTakeCards: (targetPlayer: Player) => void;
 }
@@ -16,6 +17,7 @@ export const TakeCardsModal: React.FC<TakeCardsModalProps> = ({
   onClose,
   players,
   localPlayer,
+  isMyTurn = false,
   onGiveCards,
   onTakeCards,
 }) => {
@@ -59,65 +61,81 @@ export const TakeCardsModal: React.FC<TakeCardsModalProps> = ({
               No active opponents available.
             </div>
           ) : (
-            activeOpponents.map((opp) => (
-              <div
-                key={opp.id}
-                className="p-3 bg-slate-950/80 border border-white/10 hover:border-amber-400/50 rounded-2xl transition flex flex-col gap-2.5 shadow-sm"
-              >
-                {/* Player Header: Avatar + Full Name + Cards Pill */}
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-9 h-9 rounded-xl bg-slate-800 border border-white/15 flex items-center justify-center text-xl flex-shrink-0 shadow-inner">
-                      {opp.avatar}
+            activeOpponents.map((opp) => {
+              const oppCardCount = typeof opp.cardCount === 'number' ? opp.cardCount : opp.cards.length;
+              const hasOppCards = oppCardCount > 0;
+              const hasLocalCards = localPlayer.cards.length > 0;
+
+              return (
+                <div
+                  key={opp.id}
+                  className="p-3 bg-slate-950/80 border border-white/10 hover:border-amber-400/50 rounded-2xl transition flex flex-col gap-2.5 shadow-sm"
+                >
+                  {/* Player Header: Avatar + Full Name + Cards Pill */}
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-9 h-9 rounded-xl bg-slate-800 border border-white/15 flex items-center justify-center text-xl flex-shrink-0 shadow-inner">
+                        {opp.avatar}
+                      </div>
+                      <div className="min-w-0 flex items-center gap-1.5 flex-wrap">
+                        <p className="text-sm font-bold text-white">
+                          {opp.name}
+                        </p>
+                        {opp.isHost && (
+                          <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30">
+                            Host
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <div className="min-w-0 flex items-center gap-1.5 flex-wrap">
-                      <p className="text-sm font-bold text-white">
-                        {opp.name}
-                      </p>
-                      {opp.isHost && (
-                        <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30">
-                          Host
-                        </span>
-                      )}
-                    </div>
+
+                    {/* Cards Count Badge */}
+                    <span className={`px-2.5 py-1 rounded-full text-[11px] font-bold border whitespace-nowrap flex-shrink-0 ${
+                      hasOppCards
+                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                        : 'bg-slate-800 text-slate-500 border-white/5'
+                    }`}>
+                      🎴 {oppCardCount} {oppCardCount === 1 ? 'card' : 'cards'}
+                    </span>
                   </div>
 
-                  {/* Cards Count Badge */}
-                  <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 whitespace-nowrap flex-shrink-0">
-                    🎴 {opp.cards.length} cards
-                  </span>
-                </div>
+                  {/* Actions: Dedicated full-width 2-column buttons row */}
+                  <div className="grid grid-cols-2 gap-2 pt-1 border-t border-white/5">
+                    <button
+                      onClick={() => {
+                        onGiveCards(opp);
+                        onClose();
+                      }}
+                      disabled={!hasLocalCards || isMyTurn}
+                      className="w-full py-2 px-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed text-slate-950 text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow cursor-pointer whitespace-nowrap"
+                      title={
+                        isMyTurn
+                          ? 'Cannot give cards while it is your turn to play'
+                          : hasLocalCards
+                          ? `Send request to give all your ${localPlayer.cards.length} cards to ${opp.name}`
+                          : 'You have no cards to give'
+                      }
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Give Cards</span>
+                    </button>
 
-                {/* Actions: Dedicated full-width 2-column buttons row */}
-                <div className="grid grid-cols-2 gap-2 pt-1 border-t border-white/5">
-                  <button
-                    onClick={() => {
-                      onGiveCards(opp);
-                      onClose();
-                    }}
-                    disabled={localPlayer.cards.length === 0}
-                    className="w-full py-2 px-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 active:scale-95 disabled:opacity-40 text-slate-950 text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow cursor-pointer whitespace-nowrap"
-                    title={`Send request to give all your ${localPlayer.cards.length} cards to ${opp.name}`}
-                  >
-                    <Send className="w-3.5 h-3.5" />
-                    <span>Give Cards</span>
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      onTakeCards(opp);
-                      onClose();
-                    }}
-                    disabled={opp.cards.length === 0}
-                    className="w-full py-2 px-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 active:scale-95 disabled:opacity-40 text-white text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow cursor-pointer whitespace-nowrap"
-                    title={`Send request to take all ${opp.cards.length} cards from ${opp.name}`}
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>Take Cards</span>
-                  </button>
+                    <button
+                      onClick={() => {
+                        onTakeCards(opp);
+                        onClose();
+                      }}
+                      disabled={!hasOppCards}
+                      className="w-full py-2 px-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed text-white text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow cursor-pointer whitespace-nowrap"
+                      title={hasOppCards ? `Send request to take all ${oppCardCount} cards from ${opp.name}` : `${opp.name} has no cards left`}
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Take Cards</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))
+              );
+            })
           )}
         </div>
 

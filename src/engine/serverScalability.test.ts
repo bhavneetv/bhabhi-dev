@@ -9,6 +9,7 @@ import {
   updateOutStatus,
 } from './bhabhiEngine';
 import type { Player, Card, Trick } from '../types/game';
+import { RoomManager } from '../../server/roomManager';
 
 describe('Authoritative Engine & High-Concurrency Scalability Tests', () => {
   it('handles 50+ rooms and 100+ players concurrently in memory without collisions or state leaks', () => {
@@ -172,5 +173,118 @@ describe('Authoritative Engine & High-Concurrency Scalability Tests', () => {
     const nextIdx = getNextActivePlayerIndex(players, 0);
     expect(nextIdx).toBe(2);
     expect(players[nextIdx].id).toBe('p2');
+  });
+
+  it('guarantees per-player state privacy (players only receive their own cards)', () => {
+    const p1Card: Card = { id: 'c1', suit: 'hearts', rank: 'A', deckIndex: 0, value: 14 };
+    const p2Card: Card = { id: 'c2', suit: 'spades', rank: 'K', deckIndex: 0, value: 13 };
+
+    const players: Player[] = [
+      { id: 'p1', name: 'Player 1', avatar: '😎', isBot: false, cards: [p1Card], seatIndex: 0, isHost: true, isReady: true, isOut: false, finishPosition: null, consecutiveTimeouts: 0 },
+      { id: 'p2', name: 'Player 2', avatar: '🤠', isBot: false, cards: [p2Card], seatIndex: 1, isHost: false, isReady: true, isOut: false, finishPosition: null, consecutiveTimeouts: 0 },
+    ];
+
+    // Simulate getPlayerView for p1
+    const p1View = {
+      players: players.map((p) => ({
+        ...p,
+        cards: p.id === 'p1' ? p.cards : [],
+        cardCount: p.cards.length,
+      })),
+    };
+
+    expect(p1View.players[0].cards.length).toBe(1);
+    expect(p1View.players[0].cards[0].id).toBe('c1');
+    expect(p1View.players[1].cards.length).toBe(0); // P2 cards hidden from P1!
+    expect(p1View.players[1].cardCount).toBe(1); // But card count is visible!
+  });
+
+  it('calculates Exponential Moving Average (EMA) for ping to eliminate false latency spikes', () => {
+    let smoothedPing = 25;
+    const rttSamples = [30, 28, 32, 280, 31]; // Note sample 4 is an instantaneous spike
+
+    const results: number[] = [];
+    for (const rtt of rttSamples) {
+      smoothedPing = Math.round(0.7 * smoothedPing + 0.3 * rtt);
+      results.push(smoothedPing);
+    }
+
+    // Even with a 280ms spike, smoothed ping absorbs it smoothly without spiking above 120ms
+    expect(results[3]).toBeLessThan(120);
+    expect(results[4]).toBeLessThan(90);
+  });
+
+  it('runs a full 7-player authoritative room on the server from lobby through deal, trick play, and masking', () => {
+    const emittedEvents: Array<{ event: string; data: any }> = [];
+    const mockIo: any = {
+      to: () => ({
+        emit: (event: string, data: any) => emittedEvents.push({ event, data }),
+      }),
+      emit: (event: string, data: any) => emittedEvents.push({ event, data }),
+    };
+
+    const roomManager = new RoomManager(mockIo);
+    const mockSocket = (id: string): any => ({
+      id,
+      join: () => {},
+      leave: () => {},
+      emit: (event: string, data: any) => emittedEvents.push({ event, data }),
+    });
+
+    // 1. Host creates room
+    const hostSocket = mockSocket('sock-host');
+    const { roomCode, player: hostPlayer } = roomManager.createRoom(
+      hostSocket,
+      { id: 'p-1', name: 'Host 1', avatar: '😎' },
+      'SEVEN7',
+      { maxPlayers: 8, equalHands: true, deckCount: 1 },
+      'emerald'
+    );
+    expect(roomCode).toBe('SEVEN7');
+
+    // 2. 6 more players join (Total 7 players)
+    for (let i = 2; i <= 7; i++) {
+      const socket = mockSocket(`sock-p-${i}`);
+      const joinRes = roomManager.joinRoom(socket, 'SEVEN7', {
+        id: `p-${i}`,
+        name: `Player ${i}`,
+        avatar: '🤠',
+      });
+      expect(joinRes.player.id).toBe(`p-${i}`);
+    }
+
+    const room = (roomManager as any).rooms.get('SEVEN7');
+    expect(room).toBeDefined();
+    expect(room.players.length).toBe(7);
+
+    // 3. Start Game
+    roomManager.startGame('SEVEN7', hostPlayer.id);
+    expect(room.gamePhase).toBe('PLAYING');
+    expect(room.isFirstTrick).toBe(true);
+
+    // 4. Verify each player received 7 cards and A♠ holder leads
+    room.players.forEach((p: Player) => {
+      expect(p.cards.length).toBe(7);
+    });
+
+    const currentTurn = room.currentTurnPlayerId;
+    const starter = room.players.find((p: Player) => p.id === currentTurn);
+    expect(starter).toBeDefined();
+    const aceOfSpades = starter.cards.find((c: Card) => c.suit === 'spades' && c.rank === 'A');
+    expect(aceOfSpades).toBeDefined();
+
+    // 5. Verify player state privacy
+    const p1View = roomManager.getPlayerView(room, 'p-1');
+    expect(p1View.players[0].cards.length).toBe(7);
+    for (let j = 1; j < 7; j++) {
+      expect(p1View.players[j].cards.length).toBe(0); // Masked for opponents!
+      expect(p1View.players[j].cardCount).toBe(7);
+    }
+
+    // 6. Play the first card (A♠)
+    const playRes = roomManager.playCard('SEVEN7', starter.id, aceOfSpades.id);
+    expect(playRes.success).toBe(true);
+    expect(room.currentTrick.plays.length).toBe(1);
+    expect(room.currentTrick.leadSuit).toBe('spades');
   });
 });

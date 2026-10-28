@@ -42,10 +42,18 @@ export const ResultsModal: React.FC<ResultsModalProps> = ({
     .filter((p) => p.isOut && p.finishPosition !== null)
     .sort((a, b) => (a.finishPosition || 99) - (b.finishPosition || 99));
 
+  // Guarantee the Bhabhi loser is identified from either prop or remaining players
+  const effectiveBhabhi =
+    bhabhiPlayer ||
+    players.find((p) => !p.isOut && ((p.cardCount ?? 0) > 0 || (p.cards && p.cards.length > 0))) ||
+    players.find((p) => !p.finishPosition) ||
+    players[players.length - 1] ||
+    null;
+
   const loserTitle = neutralNames ? 'LOSER' : 'BHABHI';
 
   const shareToWhatsApp = () => {
-    const loserName = bhabhiPlayer?.name || 'Someone';
+    const loserName = effectiveBhabhi?.name || 'Someone';
     const winnerName = sortedWinners[0]?.name || 'Champion';
     const text = encodeURIComponent(
       `🃏 We just played Bhabhi Dever (Thulla) Online!\n🏆 ${winnerName} won 1st Place (Dever)!\n😭 ${loserName} got stuck holding the cards and is the ${loserTitle}!\nPlay with us now!`
@@ -72,10 +80,10 @@ export const ResultsModal: React.FC<ResultsModalProps> = ({
         </div>
 
         {/* BHABHI LOSER SPOTLIGHT (PRD §5.2) */}
-        {bhabhiPlayer && (
+        {effectiveBhabhi && (
           <div className="my-6 p-4 rounded-2xl bg-gradient-to-b from-red-950/80 via-slate-900/90 to-red-950/80 border-2 border-red-500/80 shadow-[0_0_30px_rgba(239,68,68,0.4)] relative overflow-hidden">
             <div className="text-4xl mb-1 animate-bounce">
-              {bhabhiPlayer.avatar || '😭'}
+              {effectiveBhabhi.avatar || '😭'}
             </div>
             <div className="text-xs uppercase font-extrabold text-red-400 tracking-widest">
               THE OFFICIAL
@@ -92,10 +100,10 @@ export const ResultsModal: React.FC<ResultsModalProps> = ({
             </div>
 
             <div className="text-lg font-black text-white mt-1">
-              {bhabhiPlayer.name}
+              {effectiveBhabhi.name}
             </div>
             <div className="text-xs text-rose-200/80 font-medium mt-1">
-              Held the last {bhabhiPlayer.cards.length} cards at the table!
+              Held the last {effectiveBhabhi.cardCount ?? effectiveBhabhi.cards?.length ?? 0} cards at the table!
             </div>
           </div>
         )}
@@ -147,25 +155,25 @@ export const ResultsModal: React.FC<ResultsModalProps> = ({
             ))}
 
             {/* Last Place: Official Bhabhi */}
-            {bhabhiPlayer && (
+            {effectiveBhabhi && (
               <div className="flex items-center justify-between p-2.5 rounded-xl border border-red-500/60 bg-red-950/40 text-red-200">
                 <div className="flex items-center gap-2.5">
                   <span className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-black bg-red-600 text-white shadow">
                     💀
                   </span>
-                  <span className="text-base">{bhabhiPlayer.avatar}</span>
+                  <span className="text-base">{effectiveBhabhi.avatar}</span>
                   <div className="flex flex-col text-left leading-tight">
                     <span className="text-xs font-black text-red-400">
-                      BHABHI (Last Place)
+                      BHABHI (Loser of the Game)
                     </span>
                     <span className="text-[11px] font-semibold text-rose-200 truncate max-w-[130px]">
-                      {bhabhiPlayer.name}
+                      {effectiveBhabhi.name}
                     </span>
                   </div>
                 </div>
 
                 <span className="text-xs font-black uppercase tracking-wider text-red-400 bg-red-950/80 px-2.5 py-0.5 rounded border border-red-500/60 animate-pulse">
-                  🚨 BHABHI
+                  🚨 BHABHI (LOSER)
                 </span>
               </div>
             )}

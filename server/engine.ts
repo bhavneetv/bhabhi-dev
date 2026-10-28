@@ -1,6 +1,6 @@
 export type Suit = 'spades' | 'hearts' | 'diamonds' | 'clubs';
 export type Rank = '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '10' | 'J' | 'Q' | 'K' | 'A';
-export type SortMode = 'suit' | 'rank-desc' | 'rank-asc';
+export type SortMode = 'none' | 'suit' | 'rank-desc' | 'rank-asc';
 
 export interface Card {
   id: string; // e.g., '0-spades-A'
@@ -184,6 +184,7 @@ export function dealCards(
 }
 
 export function sortHand(cards: Card[], mode: SortMode = 'suit'): Card[] {
+  if (mode === 'none') return [...cards];
   const suitOrder: Record<Suit, number> = { spades: 0, hearts: 1, clubs: 2, diamonds: 3 };
   return [...cards].sort((a, b) => {
     if (mode === 'rank-desc') {
@@ -280,7 +281,7 @@ export function findHighestLeadSuitPlay(
 export function resolveThullaOutcome(
   trick: Trick,
   tieRule: 'first' | 'last' = 'first'
-): { pickerId: string; pickedCards: Card[] } {
+): { pickerId: string; pickedCards: Card[]; highestLeadCard: Card | null } {
   if (!trick.leadSuit || trick.plays.length === 0) {
     throw new Error('Cannot resolve Thulla with empty trick');
   }
@@ -290,12 +291,14 @@ export function resolveThullaOutcome(
     return {
       pickerId: trick.plays[0].playerId,
       pickedCards: trick.plays.map((p) => p.card),
+      highestLeadCard: null,
     };
   }
 
   return {
     pickerId: highest.playerId,
     pickedCards: trick.plays.map((p) => p.card),
+    highestLeadCard: highest.card,
   };
 }
 
@@ -314,6 +317,51 @@ export function resolveCleanOutcome(
     winnerId,
     discardedCards: trick.plays.map((p) => p.card),
   };
+}
+
+/**
+ * When a trick ends cleanly:
+ * - The player who played the highest card of the lead suit wins and leads next.
+ * - CRITICAL BHABHI RULE: If the winner has NO cards left (sheds all cards and goes safe),
+ *   the lead shifts to the player who played the 2nd highest card of the lead suit (or 3rd, etc.)
+ *   who still has cards remaining!
+ */
+export function determineNextLeaderAfterCleanTrick(
+  trick: Trick,
+  players: Player[],
+  winnerId: string,
+  tieRule: 'first' | 'last' = 'first'
+): string {
+  const winner = players.find((p) => p.id === winnerId);
+  if (winner && !winner.isOut && winner.cards.length > 0) {
+    return winnerId;
+  }
+
+  // Winner has no cards left! Shift lead to the player with the second highest card in the trick.
+  const leadPlays = trick.plays.filter((p) => p.card.suit === trick.leadSuit);
+
+  leadPlays.sort((a, b) => {
+    if (b.card.value !== a.card.value) {
+      return b.card.value - a.card.value;
+    }
+    const idxA = trick.plays.indexOf(a);
+    const idxB = trick.plays.indexOf(b);
+    return tieRule === 'last' ? idxB - idxA : idxA - idxB;
+  });
+
+  const nextEligiblePlay = leadPlays.find((play) => {
+    const pl = players.find((p) => p.id === play.playerId);
+    return pl && !pl.isOut && pl.cards.length > 0;
+  });
+
+  if (nextEligiblePlay) {
+    return nextEligiblePlay.playerId;
+  }
+
+  // Fallback to next active player in seat order
+  const winnerIndex = players.findIndex((p) => p.id === winnerId);
+  const fallbackIdx = getNextActivePlayerIndex(players, winnerIndex >= 0 ? winnerIndex : 0);
+  return players[fallbackIdx]?.id || winnerId;
 }
 
 export function getNextActivePlayerIndex(players: Player[], fromIndex: number): number {

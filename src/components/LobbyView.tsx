@@ -271,36 +271,38 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
             </div>
           </div>
 
-          {/* Grid of Players */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
+          {/* Grid of Players with generous spacing and modern cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3.5 sm:gap-4.5">
             {players.map((p) => {
               const canEditName = p.id === localPlayer.id || isHost;
               return (
                 <div
                   key={p.id}
-                  className={`p-3 rounded-2xl border flex items-center justify-between transition-all ${
+                  className={`p-3.5 sm:p-4 rounded-2xl border flex items-center justify-between transition-all backdrop-blur-md shadow-md ${
                     p.id === localPlayer.id
-                      ? 'bg-amber-950/30 border-amber-500/60 shadow-[0_0_15px_rgba(245,158,11,0.2)]'
-                      : 'bg-slate-900/60 border-white/10'
+                      ? 'bg-gradient-to-br from-amber-950/40 to-slate-900/90 border-amber-500/60 shadow-[0_0_20px_rgba(245,158,11,0.25)] ring-1 ring-amber-400/30'
+                      : 'bg-gradient-to-br from-slate-900/80 to-slate-950/80 border-white/10 hover:border-white/20'
                   }`}
                 >
-                  <div className="flex items-center gap-2 truncate">
+                  <div className="flex items-center gap-3 truncate min-w-0">
                     <div className="relative flex-shrink-0">
-                      <span className="text-2xl">{p.avatar}</span>
+                      <div className="w-11 h-11 rounded-2xl bg-slate-950 border border-white/15 flex items-center justify-center text-2xl shadow-inner">
+                        {p.avatar}
+                      </div>
                       {p.isHost && (
-                        <span className="absolute -top-1 -left-1 text-amber-400">
-                          <Crown className="w-3.5 h-3.5 fill-current" />
-                        </span>
+                        <div className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-amber-500 text-slate-950 flex items-center justify-center shadow">
+                          <Crown className="w-3 h-3 fill-current" />
+                        </div>
                       )}
                       {p.isBot && (
-                        <span className="absolute -top-1 -right-1 text-cyan-400">
-                          <Bot className="w-3.5 h-3.5" />
-                        </span>
+                        <div className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-slate-800 text-cyan-400 border border-cyan-400/50 flex items-center justify-center shadow">
+                          <Bot className="w-3 h-3" />
+                        </div>
                       )}
                     </div>
                     <div className="flex flex-col truncate min-w-0">
-                      <div className="flex items-center gap-1">
-                        <span className="text-xs sm:text-sm font-bold text-white truncate">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs sm:text-sm font-black text-white truncate">
                           {p.name}
                         </span>
                         {canEditName && (
@@ -313,13 +315,21 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
                           </button>
                         )}
                       </div>
-                      <span className="text-[10px] text-slate-400">
-                        {p.isHost
-                          ? 'Host'
+                      <span className={`text-[10px] font-bold ${
+                        p.isHost
+                          ? 'text-amber-400'
                           : p.isBot
-                          ? `Bot (${p.botDifficulty})`
+                          ? 'text-cyan-400'
                           : p.id === localPlayer.id
-                          ? 'You (Ready)'
+                          ? 'text-emerald-400'
+                          : 'text-slate-400'
+                      }`}>
+                        {p.isHost
+                          ? '👑 Host'
+                          : p.isBot
+                          ? `🤖 Bot (${p.botDifficulty})`
+                          : p.id === localPlayer.id
+                          ? '✓ You (Ready)'
                           : 'Live Player'}
                       </span>
                     </div>
@@ -329,7 +339,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
                   {isHost && p.id !== localPlayer.id && (
                     <button
                       onClick={() => onRemovePlayer(p.id)}
-                      className="p-1 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-950/40 transition cursor-pointer flex-shrink-0 ml-1"
+                      className="p-1.5 rounded-xl text-slate-500 hover:text-red-400 hover:bg-red-950/40 transition cursor-pointer flex-shrink-0 ml-1.5 border border-transparent hover:border-red-500/30"
                       title="Remove Player"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -343,9 +353,10 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
             {Array.from({ length: Math.min(2, settings.maxPlayers - players.length) }).map((_, i) => (
               <div
                 key={i}
-                className="p-3 rounded-2xl border border-dashed border-white/10 flex items-center justify-center text-slate-500 text-xs font-semibold select-none"
+                className="p-3.5 sm:p-4 rounded-2xl border-2 border-dashed border-white/10 bg-slate-950/30 flex items-center justify-center text-slate-500 text-xs font-semibold select-none gap-2"
               >
-                Open Seat #{players.length + i + 1}
+                <span>➕</span>
+                <span>Open Seat #{players.length + i + 1}</span>
               </div>
             ))}
           </div>

@@ -1,11 +1,13 @@
 import { Server, Socket } from 'socket.io';
-import {
+import type {
   Player,
   Card,
   Trick,
   RoomSettings,
   Theme,
   ChatMessage,
+} from './engine';
+import {
   dealCards,
   findStartingPlayerIndex,
   canPlayCard,
@@ -13,6 +15,7 @@ import {
   resolveThullaOutcome,
   getNextActivePlayerIndex,
   updateOutStatus,
+  determineNextLeaderAfterCleanTrick,
   botChooseCard,
   sortHand,
 } from './engine';
@@ -37,6 +40,7 @@ export interface RoomState {
   turnTimer: NodeJS.Timeout | null;
   resolutionTimer: NodeJS.Timeout | null;
   transferRequests: Map<string, any>;
+  lastMovePerPlayer: Map<string, string>; // playerId -> cardId played in current trick
 }
 
 const DEFAULT_SETTINGS: RoomSettings = {
@@ -48,7 +52,7 @@ const DEFAULT_SETTINGS: RoomSettings = {
   neutralNames: false,
   cardTracker: true,
   voiceEnabled: false,
-  maxPlayers: 6,
+  maxPlayers: 8,
   fourColorSuits: true,
   animationSpeed: 'normal',
 };
@@ -108,6 +112,7 @@ export class RoomManager {
   private io: Server;
   private rooms: Map<string, RoomState> = new Map();
   private socketToRoom: Map<string, string> = new Map(); // socketId -> roomCode
+  private lobbyDisconnectTimers: Map<string, NodeJS.Timeout> = new Map(); // roomCode:playerId -> timer
 
   constructor(io: Server) {
     this.io = io;
@@ -196,6 +201,7 @@ export class RoomManager {
       turnTimer: null,
       resolutionTimer: null,
       transferRequests: new Map(),
+      lastMovePerPlayer: new Map(),
     };
 
     this.rooms.set(roomCode, room);
@@ -205,7 +211,7 @@ export class RoomManager {
     return {
       roomCode,
       player: hostPlayer,
-      state: this.getPublicRoomState(room),
+      state: this.getPlayerView(room, hostPlayer.id),
     };
   }
 
@@ -256,6 +262,7 @@ export class RoomManager {
         turnTimer: null,
         resolutionTimer: null,
         transferRequests: new Map(),
+        lastMovePerPlayer: new Map(),
       };
 
       this.rooms.set(cleanCode, room);
@@ -265,9 +272,17 @@ export class RoomManager {
       return {
         roomCode: cleanCode,
         player: hostPlayer,
-        state: this.getPublicRoomState(room),
+        state: this.getPlayerView(room, hostPlayer.id),
         isReconnecting: false,
       };
+    }
+
+    // Cancel any pending lobby disconnect grace timer for this player
+    const timerKey = `${cleanCode}:${playerData.id}`;
+    const pendingTimer = this.lobbyDisconnectTimers.get(timerKey);
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      this.lobbyDisconnectTimers.delete(timerKey);
     }
 
     // Check if player is reconnecting
@@ -279,6 +294,19 @@ export class RoomManager {
       p.name = playerData.name || p.name;
       p.avatar = playerData.avatar || p.avatar;
 
+      // Cancel any pending bot timer so AI does not steal the reconnected player's turn
+      if (room.botTimer && room.currentTurnPlayerId === p.id) {
+        clearTimeout(room.botTimer);
+        room.botTimer = null;
+      }
+
+      // Clean stale socket mappings if player reconnected on a new socket
+      const oldSocketId = room.socketMap.get(p.id);
+      if (oldSocketId && oldSocketId !== socket.id) {
+        room.reverseSocketMap.delete(oldSocketId);
+        this.socketToRoom.delete(oldSocketId);
+      }
+
       room.socketMap.set(p.id, socket.id);
       room.reverseSocketMap.set(socket.id, p.id);
       this.socketToRoom.set(socket.id, cleanCode);
@@ -288,7 +316,7 @@ export class RoomManager {
       return {
         roomCode: cleanCode,
         player: p,
-        state: this.getPublicRoomState(room),
+        state: this.getPlayerView(room, p.id),
         isReconnecting: true,
       };
     }
@@ -300,6 +328,19 @@ export class RoomManager {
         offlineHuman.isOnline = true;
         offlineHuman.name = playerData.name || offlineHuman.name;
         offlineHuman.avatar = playerData.avatar || offlineHuman.avatar;
+
+        // Cancel any pending bot timer so AI does not steal the reconnected player's turn
+        if (room.botTimer && room.currentTurnPlayerId === offlineHuman.id) {
+          clearTimeout(room.botTimer);
+          room.botTimer = null;
+        }
+
+        const oldSocketId = room.socketMap.get(offlineHuman.id);
+        if (oldSocketId && oldSocketId !== socket.id) {
+          room.reverseSocketMap.delete(oldSocketId);
+          this.socketToRoom.delete(oldSocketId);
+        }
+
         room.socketMap.set(offlineHuman.id, socket.id);
         room.reverseSocketMap.set(socket.id, offlineHuman.id);
         this.socketToRoom.set(socket.id, cleanCode);
@@ -309,14 +350,14 @@ export class RoomManager {
         return {
           roomCode: cleanCode,
           player: offlineHuman,
-          state: this.getPublicRoomState(room),
+          state: this.getPlayerView(room, offlineHuman.id),
           isReconnecting: true,
         };
       }
     }
 
-    if (room.players.length >= (room.settings.maxPlayers || 6)) {
-      throw new Error(`Room ${cleanCode} is full (max ${room.settings.maxPlayers} players)`);
+    if (room.players.length >= (room.settings.maxPlayers || 8)) {
+      throw new Error(`Room ${cleanCode} is full (max ${room.settings.maxPlayers || 8} players)`);
     }
 
     const newPlayer: Player = {
@@ -346,12 +387,12 @@ export class RoomManager {
     return {
       roomCode: cleanCode,
       player: newPlayer,
-      state: this.getPublicRoomState(room),
+      state: this.getPlayerView(room, newPlayer.id),
       isReconnecting: false,
     };
   }
 
-  public leaveRoom(socket: Socket, roomCode: string, playerId: string) {
+  public leaveRoom(socket: Socket, roomCode: string, playerId: string, isExplicit: boolean = true) {
     const cleanCode = roomCode.toUpperCase().trim();
     const room = this.rooms.get(cleanCode);
     if (!room) return;
@@ -359,26 +400,63 @@ export class RoomManager {
     const player = room.players.find((p) => p.id === playerId);
     if (!player) return;
 
+    const timerKey = `${cleanCode}:${playerId}`;
+    const pendingTimer = this.lobbyDisconnectTimers.get(timerKey);
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      this.lobbyDisconnectTimers.delete(timerKey);
+    }
+
     if (room.gamePhase === 'LOBBY') {
-      // Remove player completely
-      room.players = room.players.filter((p) => p.id !== playerId);
-      room.socketMap.delete(playerId);
-      room.reverseSocketMap.delete(socket.id);
-      this.socketToRoom.delete(socket.id);
-      socket.leave(cleanCode);
+      if (isExplicit) {
+        // Player explicitly clicked leave room
+        room.players = room.players.filter((p) => p.id !== playerId);
+        room.socketMap.delete(playerId);
+        room.reverseSocketMap.delete(socket.id);
+        this.socketToRoom.delete(socket.id);
+        socket.leave(cleanCode);
 
-      if (room.players.length === 0) {
-        this.clearRoomTimers(room);
-        this.rooms.delete(cleanCode);
-        return;
+        if (room.players.length === 0) {
+          this.clearRoomTimers(room);
+          this.rooms.delete(cleanCode);
+          return;
+        }
+
+        // If host left, promote next human player
+        if (player.isHost && room.players.length > 0) {
+          room.players[0].isHost = true;
+        }
+
+        this.broadcastRoomState(room, `👋 ${player.name} left the room`);
+      } else {
+        // Socket disconnected (e.g. mobile tab switch / brief blip) -> Give 20s grace period
+        player.isOnline = false;
+        room.reverseSocketMap.delete(socket.id);
+        this.socketToRoom.delete(socket.id);
+        this.broadcastRoomState(room);
+
+        const timeout = setTimeout(() => {
+          this.lobbyDisconnectTimers.delete(timerKey);
+          const currentRoom = this.rooms.get(cleanCode);
+          if (!currentRoom || currentRoom.gamePhase !== 'LOBBY') return;
+          const p = currentRoom.players.find((pl) => pl.id === playerId);
+          if (p && !p.isOnline) {
+            currentRoom.players = currentRoom.players.filter((pl) => pl.id !== playerId);
+            currentRoom.socketMap.delete(playerId);
+            if (currentRoom.players.length === 0) {
+              this.clearRoomTimers(currentRoom);
+              this.rooms.delete(cleanCode);
+            } else {
+              if (p.isHost && currentRoom.players.length > 0) {
+                currentRoom.players[0].isHost = true;
+              }
+              this.broadcastRoomState(currentRoom, `👋 ${p.name} timed out from lobby`);
+            }
+          }
+        }, 20000);
+
+        this.lobbyDisconnectTimers.set(timerKey, timeout);
       }
-
-      // If host left, promote next human player
-      if (player.isHost && room.players.length > 0) {
-        room.players[0].isHost = true;
-      }
-
-      this.broadcastRoomState(room, `👋 ${player.name} left the room`);
     } else {
       // In game: Mark offline, DO NOT kick or end game prematurely
       player.isOnline = false;
@@ -404,7 +482,7 @@ export class RoomManager {
     const playerId = room.reverseSocketMap.get(socket.id);
     if (!playerId) return;
 
-    this.leaveRoom(socket, roomCode, playerId);
+    this.leaveRoom(socket, roomCode, playerId, false); // isExplicit = false
   }
 
   public startGame(roomCode: string, requesterId?: string) {
@@ -448,6 +526,7 @@ export class RoomManager {
         turnTimer: null,
         resolutionTimer: null,
         transferRequests: new Map(),
+        lastMovePerPlayer: new Map(),
       };
       this.rooms.set(cleanCode, room);
     }
@@ -470,7 +549,7 @@ export class RoomManager {
     );
 
     room.players = dealtPlayers;
-    const { playerIndex, cardId } = findStartingPlayerIndex(room.players);
+    const { playerIndex } = findStartingPlayerIndex(room.players);
     const startingPlayer = room.players[playerIndex] || room.players[0];
 
     room.gamePhase = 'PLAYING';
@@ -479,6 +558,7 @@ export class RoomManager {
     room.currentTrick = { leadSuit: null, plays: [] };
     room.deadPile = [];
     room.bhabhiPlayer = null;
+    room.lastMovePerPlayer = new Map();
     room.sequenceNumber++;
 
     this.broadcastRoomState(room, `Game started! ${startingPlayer.name} holds Ace of Spades (A♠) and leads!`);
@@ -492,7 +572,7 @@ export class RoomManager {
     }
   }
 
-  public playCard(roomCode: string, playerId: string, cardId: string) {
+  public playCard(roomCode: string, playerId: string, cardId: string, socketId?: string) {
     const cleanCode = roomCode.toUpperCase().trim();
     const room = this.rooms.get(cleanCode);
     if (!room) return { success: true };
@@ -501,16 +581,34 @@ export class RoomManager {
       return { success: true };
     }
 
-    if (room.currentTurnPlayerId !== playerId) {
-      // Idempotency: if this exact card was just played by this player in current trick, succeed silently
-      const lastPlay = room.currentTrick.plays[room.currentTrick.plays.length - 1];
-      if (lastPlay && lastPlay.playerId === playerId && lastPlay.card.id === cardId) {
-        return { success: true };
+    // Resolve effective playerId using socket mapping if provided or if playerId was desynced
+    let resolvedPlayerId = playerId;
+    if (socketId && room.reverseSocketMap.has(socketId)) {
+      const mappedId = room.reverseSocketMap.get(socketId)!;
+      const mappedPlayer = room.players.find((p) => p.id === mappedId);
+      if (mappedPlayer && (mappedId === room.currentTurnPlayerId || mappedPlayer.cards.some((c) => c.id === cardId))) {
+        resolvedPlayerId = mappedId;
       }
+    }
+
+    // Idempotency: if this exact card was already played in current trick by this player, succeed silently
+    const alreadyPlayedInTrick = room.currentTrick.plays.some(
+      (p) => p.playerId === resolvedPlayerId && p.card.id === cardId
+    );
+    if (alreadyPlayedInTrick) {
+      return { success: true };
+    }
+
+    if (room.currentTurnPlayerId !== resolvedPlayerId) {
       return { success: false, error: 'Not your turn!' };
     }
 
-    const player = room.players.find((p) => p.id === playerId);
+    // Move deduplication: prevent double card drops in the same trick
+    if (room.lastMovePerPlayer.has(resolvedPlayerId)) {
+      return { success: false, error: 'You have already played in this trick!' };
+    }
+
+    const player = room.players.find((p) => p.id === resolvedPlayerId);
     if (!player) return { success: true };
 
     const card = player.cards.find((c) => c.id === cardId);
@@ -524,12 +622,14 @@ export class RoomManager {
     // Card is valid: remove from hand
     player.cards = player.cards.filter((c) => c.id !== cardId);
     player.cardCount = player.cards.length;
+    room.lastMovePerPlayer.set(resolvedPlayerId, cardId);
 
     const isLead = !room.currentTrick.leadSuit;
-    const isThulla = !isLead && card.suit !== room.currentTrick.leadSuit;
+    // User requirement: First round Thullas are ignored / passed cleanly without penalty
+    const isThulla = !isLead && card.suit !== room.currentTrick.leadSuit && !room.isFirstTrick;
 
     const newPlay = {
-      playerId,
+      playerId: resolvedPlayerId,
       card,
       isThulla,
       timestamp: Date.now(),
@@ -544,7 +644,7 @@ export class RoomManager {
 
     // Broadcast instant card play event to all clients for animation sync
     this.io.to(room.code).emit('CARD_PLAYED', {
-      playerId,
+      playerId: resolvedPlayerId,
       card,
       isThulla,
       isLead,
@@ -561,13 +661,14 @@ export class RoomManager {
     // ==========================================
     if (isThulla) {
       room.gamePhase = 'THULLA_RESOLVE';
-      const { pickerId, pickedCards } = resolveThullaOutcome(room.currentTrick, room.settings.tieRule);
+      const { pickerId, pickedCards, highestLeadCard } = resolveThullaOutcome(room.currentTrick, room.settings.tieRule);
       const picker = room.players.find((p) => p.id === pickerId);
 
       this.io.to(room.code).emit('THULLA_EVENT', {
-        cutterId: playerId,
+        cutterId: resolvedPlayerId,
         cutterName: player.name,
         cutCard: card,
+        highestLeadCard,
         pickerId,
         pickerName: picker?.name || 'Picker',
         pickedCount: pickedCards.length,
@@ -578,13 +679,14 @@ export class RoomManager {
         // Give cards to picker
         const pickerIdx = room.players.findIndex((p) => p.id === pickerId);
         if (pickerIdx !== -1) {
-          room.players[pickerIdx].cards = sortHand([...room.players[pickerIdx].cards, ...pickedCards]);
+          room.players[pickerIdx].cards = [...room.players[pickerIdx].cards, ...pickedCards];
           room.players[pickerIdx].cardCount = room.players[pickerIdx].cards.length;
         }
 
         // Reset trick
         room.currentTrick = { leadSuit: null, plays: [] };
         room.isFirstTrick = false;
+        room.lastMovePerPlayer.clear();
 
         // Check who got out
         const { updatedPlayers, newlyOut } = updateOutStatus(room.players, pickerId);
@@ -640,8 +742,10 @@ export class RoomManager {
       room.resolutionTimer = setTimeout(() => {
         // Discard to dead pile
         room.deadPile.push(...discardedCards);
+        const resolvedTrick = room.currentTrick;
         room.currentTrick = { leadSuit: null, plays: [] };
         room.isFirstTrick = false;
+        room.lastMovePerPlayer.clear();
 
         // Check who got out
         const { updatedPlayers, newlyOut } = updateOutStatus(room.players);
@@ -661,14 +765,13 @@ export class RoomManager {
           return;
         }
 
-        // Winner leads next trick, or next active player if winner went out
-        const currentWinner = room.players.find((p) => p.id === winnerId);
-        let nextLeaderId = winnerId;
-        if (!currentWinner || currentWinner.isOut || currentWinner.cards.length === 0) {
-          const winnerIndex = room.players.findIndex((p) => p.id === winnerId);
-          const nextActiveIdx = getNextActivePlayerIndex(room.players, winnerIndex);
-          nextLeaderId = room.players[nextActiveIdx].id;
-        }
+        // Winner leads next trick, or next highest card if winner has no cards left!
+        const nextLeaderId = determineNextLeaderAfterCleanTrick(
+          resolvedTrick,
+          room.players,
+          winnerId,
+          room.settings.tieRule
+        );
 
         room.currentTurnPlayerId = nextLeaderId;
         room.gamePhase = 'PLAYING';
@@ -685,7 +788,7 @@ export class RoomManager {
     }
 
     // Trick not finished: Advance turn to next active player
-    const currentIdx = room.players.findIndex((p) => p.id === playerId);
+    const currentIdx = room.players.findIndex((p) => p.id === resolvedPlayerId);
     const nextIdx = getNextActivePlayerIndex(room.players, currentIdx);
     const nextPlayer = room.players[nextIdx];
 
@@ -697,6 +800,40 @@ export class RoomManager {
       this.scheduleBotMove(room, 900);
     }
 
+    return { success: true };
+  }
+
+  public returnToLobby(roomCode: string, _playerId?: string) {
+    const cleanCode = roomCode.toUpperCase().trim();
+    const room = this.rooms.get(cleanCode);
+    if (!room) return { success: true };
+
+    this.clearRoomTimers(room);
+
+    room.gamePhase = 'LOBBY';
+    room.currentTrick = { leadSuit: null, plays: [] };
+    room.deadPile = [];
+    room.bhabhiPlayer = null;
+    room.isFirstTrick = true;
+    room.lastMovePerPlayer.clear();
+    room.transferRequests.clear();
+
+    // Reset player hands & game statuses for next match
+    room.players = room.players.map((p) => ({
+      ...p,
+      cards: [],
+      cardCount: 0,
+      isOut: false,
+      finishPosition: null,
+      consecutiveTimeouts: 0,
+      isReady: true,
+    }));
+
+    if (room.players.length > 0) {
+      room.currentTurnPlayerId = room.players[0].id;
+    }
+
+    this.broadcastRoomState(room, 'Returned to Lobby');
     return { success: true };
   }
 
@@ -755,13 +892,17 @@ export class RoomManager {
     const player = room.players.find((p) => p.id === playerId);
     if (!player) return;
 
-    player.ping = Math.round(ping);
+    const newPing = Math.max(1, Math.round(ping));
+    const oldPing = player.ping || 0;
+    player.ping = newPing;
 
-    // Broadcast ping updates to all room participants
-    this.io.to(room.code).emit('PLAYERS_PING_UPDATE', {
-      playerId,
-      ping: player.ping,
-    });
+    // Only broadcast if ping changed significantly (>= 15ms) or first report to prevent network saturation
+    if (Math.abs(newPing - oldPing) >= 15 || oldPing === 0) {
+      this.io.to(room.code).emit('PLAYERS_PING_UPDATE', {
+        playerId,
+        ping: player.ping,
+      });
+    }
   }
 
   public handleChatMessage(roomCode: string, senderId: string, text: string) {
@@ -790,13 +931,55 @@ export class RoomManager {
     const toP = room.players.find((p) => p.id === toPlayerId);
     if (!fromP || !toP || fromP.cards.length === 0) return;
 
-    const count = cardCount || 1;
+    // If cardCount not specified or greater than available, transfer all fromP cards
+    const count = cardCount && cardCount > 0 ? Math.min(cardCount, fromP.cards.length) : fromP.cards.length;
     const cardsToMove = fromP.cards.slice(0, count);
     fromP.cards = fromP.cards.slice(count);
     toP.cards = sortHand([...toP.cards, ...cardsToMove]);
 
     fromP.cardCount = fromP.cards.length;
     toP.cardCount = toP.cards.length;
+
+    // Receiver now has cards, so they cannot be out
+    toP.isOut = false;
+    toP.finishPosition = null;
+
+    // Update safe status for players who shed all cards
+    const { updatedPlayers, newlyOut } = updateOutStatus(room.players);
+    room.players = updatedPlayers;
+
+    if (newlyOut.length > 0) {
+      this.io.to(room.code).emit('PLAYERS_OUT_EVENT', { newlyOut });
+    }
+
+    // Check if only 1 player remains with cards -> GAME OVER
+    const remainingWithCards = room.players.filter((p) => !p.isOut && p.cards.length > 0);
+    if (remainingWithCards.length <= 1 && room.players.length > 1) {
+      const loser = remainingWithCards[0] || toP;
+      room.bhabhiPlayer = loser;
+      room.gamePhase = 'GAME_OVER';
+      this.clearRoomTimers(room);
+      this.broadcastRoomState(room, `🏁 GAME OVER! ${loser.name} is the BHABHI!`);
+      return;
+    }
+
+    // CRITICAL USER REQUIREMENT:
+    // If it was the giver's turn (or currentTurnPlayerId now has 0 cards / is out),
+    // immediately skip their turn and advance to the next active player with cards!
+    const currentTurnP = room.players.find((p) => p.id === room.currentTurnPlayerId);
+    if (!currentTurnP || currentTurnP.isOut || currentTurnP.cards.length === 0) {
+      const giverIdx = room.players.findIndex((p) => p.id === fromPlayerId);
+      const nextIdx = getNextActivePlayerIndex(room.players, giverIdx >= 0 ? giverIdx : 0);
+      const nextP = room.players[nextIdx];
+      if (nextP) {
+        room.currentTurnPlayerId = nextP.id;
+        this.startTurnTimer(room);
+
+        if (nextP.isBot || !nextP.isOnline) {
+          this.scheduleBotMove(room, 900);
+        }
+      }
+    }
 
     this.broadcastRoomState(room, `🔄 ${fromP.name} transferred ${count} card(s) to ${toP.name}`);
   }
@@ -840,18 +1023,69 @@ export class RoomManager {
     this.broadcastRoomState(room, `✏️ ${p.name} updated name`);
   }
 
+  public addBot(roomCode: string, _requesterId: string, difficulty: 'easy' | 'medium' | 'hard' = 'medium') {
+    const cleanCode = roomCode.toUpperCase().trim();
+    const room = this.rooms.get(cleanCode);
+    if (!room || room.gamePhase !== 'LOBBY') return;
+    if (room.players.length >= (room.settings.maxPlayers || 8)) {
+      throw new Error(`Room is full (max ${room.settings.maxPlayers || 8} players)`);
+    }
+
+    const botNames = ['Bot Vicky', 'Bot Sunny', 'Bot Simran', 'Bot Bunty', 'Bot Preet', 'Bot Rocky', 'Bot Priya', 'Bot Kabir'];
+    const botAvatars = ['🤠', '🦁', '🦊', '🐼', '🤖', '👑', '🐯', '⚡'];
+    const botNum = room.players.filter((p) => p.isBot).length + 1;
+    const name = botNames[(botNum - 1) % botNames.length] || `Bot ${botNum}`;
+    const avatar = botAvatars[(botNum - 1) % botAvatars.length] || '🤖';
+
+    const newBot: Player = {
+      id: `bot-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+      name: `${name} (${difficulty})`,
+      avatar,
+      isBot: true,
+      botDifficulty: difficulty,
+      cards: [],
+      seatIndex: room.players.length,
+      isHost: false,
+      isReady: true,
+      isOut: false,
+      finishPosition: null,
+      consecutiveTimeouts: 0,
+      isOnline: true,
+      ping: Math.floor(Math.random() * 10) + 5,
+    };
+
+    room.players.push(newBot);
+    this.broadcastRoomState(room, `🤖 Added ${newBot.name} to room`);
+  }
+
+  public removePlayer(roomCode: string, _requesterId: string, targetPlayerId: string) {
+    const cleanCode = roomCode.toUpperCase().trim();
+    const room = this.rooms.get(cleanCode);
+    if (!room || room.gamePhase !== 'LOBBY') return;
+    if (room.players.length <= 2) {
+      throw new Error('Minimum 2 players required');
+    }
+    const idx = room.players.findIndex((p) => p.id === targetPlayerId);
+    if (idx === -1) return;
+    const removed = room.players.splice(idx, 1)[0];
+    room.players.forEach((p, i) => (p.seatIndex = i));
+    this.broadcastRoomState(room, `Removed ${removed.name}`);
+  }
+
   private clearRoomTimers(room: RoomState) {
     if (room.botTimer) clearTimeout(room.botTimer);
     if (room.turnTimer) clearInterval(room.turnTimer);
     if (room.resolutionTimer) clearTimeout(room.resolutionTimer);
   }
 
-  private getPublicRoomState(room: RoomState) {
+  public getPlayerView(room: RoomState, forPlayerId?: string) {
     return {
       code: room.code,
       players: room.players.map((p) => ({
         ...p,
-        // cardCount is always public
+        // Only disclose full cards array to the owner player!
+        cards: p.id === forPlayerId ? p.cards : [],
+        // cardCount is always public so all players see opponents' hand sizes
         cardCount: p.cards.length,
       })),
       currentTurnPlayerId: room.currentTurnPlayerId,
@@ -868,12 +1102,27 @@ export class RoomManager {
     };
   }
 
+  public getPublicRoomState(room: RoomState, forPlayerId?: string) {
+    return this.getPlayerView(room, forPlayerId);
+  }
+
   private broadcastRoomState(room: RoomState, toastMsg?: string) {
     room.sequenceNumber++;
-    const publicState = this.getPublicRoomState(room);
 
-    this.io.to(room.code).emit('ROOM_STATE_UPDATED', {
-      state: publicState,
+    // 1. Send personalized view to each connected player (only their own cards visible)
+    for (const [playerId, socketId] of room.socketMap.entries()) {
+      const playerView = this.getPlayerView(room, playerId);
+      this.io.to(socketId).emit('ROOM_STATE_UPDATED', {
+        state: playerView,
+        toast: toastMsg,
+        sequenceNumber: room.sequenceNumber,
+      });
+    }
+
+    // 2. Also emit spectator view (all cards hidden) to the room code
+    const spectatorView = this.getPlayerView(room);
+    this.io.to(room.code).emit('ROOM_STATE_UPDATED_PUBLIC', {
+      state: spectatorView,
       toast: toastMsg,
       sequenceNumber: room.sequenceNumber,
     });

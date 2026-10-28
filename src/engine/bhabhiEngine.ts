@@ -107,6 +107,7 @@ export function dealCards(
  * Sorts cards by suit priority (Spades, Hearts, Clubs, Diamonds) or rank
  */
 export function sortHand(cards: Card[], mode: SortMode = 'suit'): Card[] {
+  if (mode === 'none') return [...cards];
   const suitOrder: Record<Suit, number> = { spades: 0, hearts: 1, clubs: 2, diamonds: 3 };
   return [...cards].sort((a, b) => {
     if (mode === 'rank-desc') {
@@ -117,11 +118,11 @@ export function sortHand(cards: Card[], mode: SortMode = 'suit'): Card[] {
       if (a.value !== b.value) return a.value - b.value;
       return suitOrder[a.suit] - suitOrder[b.suit];
     }
-    // Default: 'suit' priority, then rank ascending
+    // Default: 'suit' priority, then rank descending (A down to 2)
     if (suitOrder[a.suit] !== suitOrder[b.suit]) {
       return suitOrder[a.suit] - suitOrder[b.suit];
     }
-    return a.value - b.value;
+    return b.value - a.value;
   });
 }
 
@@ -224,7 +225,7 @@ export function findHighestLeadSuitPlay(
 export function resolveThullaOutcome(
   trick: Trick,
   tieRule: 'first' | 'last' = 'first'
-): { pickerId: string; pickedCards: Card[] } {
+): { pickerId: string; pickedCards: Card[]; highestLeadCard?: Card | null } {
   if (!trick.leadSuit || trick.plays.length === 0) {
     throw new Error('Cannot resolve Thulla with empty trick');
   }
@@ -234,12 +235,14 @@ export function resolveThullaOutcome(
     return {
       pickerId: trick.plays[0].playerId,
       pickedCards: trick.plays.map((p) => p.card),
+      highestLeadCard: null,
     };
   }
 
   return {
     pickerId: highest.playerId,
     pickedCards: trick.plays.map((p) => p.card),
+    highestLeadCard: highest.card,
   };
 }
 
@@ -265,13 +268,60 @@ export function resolveCleanOutcome(
 }
 
 /**
+ * When a trick ends cleanly:
+ * - The player who played the highest card of the lead suit wins and leads next.
+ * - CRITICAL BHABHI RULE: If the winner has NO cards left (sheds all cards and goes safe),
+ *   the lead shifts to the player who played the 2nd highest card of the lead suit (or 3rd, etc.)
+ *   who still has cards remaining!
+ */
+export function determineNextLeaderAfterCleanTrick(
+  trick: Trick,
+  players: Player[],
+  winnerId: string,
+  tieRule: 'first' | 'last' = 'first'
+): string {
+  const winner = players.find((p) => p.id === winnerId);
+  if (winner && !winner.isOut && winner.cards.length > 0) {
+    return winnerId;
+  }
+
+  // Winner has no cards left! Shift lead to the player with the second highest card in the trick.
+  const leadPlays = trick.plays.filter((p) => p.card.suit === trick.leadSuit);
+
+  leadPlays.sort((a, b) => {
+    if (b.card.value !== a.card.value) {
+      return b.card.value - a.card.value;
+    }
+    const idxA = trick.plays.indexOf(a);
+    const idxB = trick.plays.indexOf(b);
+    return tieRule === 'last' ? idxB - idxA : idxA - idxB;
+  });
+
+  const nextEligiblePlay = leadPlays.find((play) => {
+    const pl = players.find((p) => p.id === play.playerId);
+    return pl && !pl.isOut && pl.cards.length > 0;
+  });
+
+  if (nextEligiblePlay) {
+    return nextEligiblePlay.playerId;
+  }
+
+  // Fallback to next active player in seat order
+  const winnerIndex = players.findIndex((p) => p.id === winnerId);
+  const fallbackIdx = getNextActivePlayerIndex(players, winnerIndex >= 0 ? winnerIndex : 0);
+  return players[fallbackIdx]?.id || winnerId;
+}
+
+/**
  * Calculates the next active (not out) player in clockwise order
  */
 export function getNextActivePlayerIndex(players: Player[], fromIndex: number): number {
   const n = players.length;
   for (let step = 1; step <= n; step++) {
     const idx = (fromIndex + step) % n;
-    if (!players[idx].isOut && players[idx].cards.length > 0) {
+    const p = players[idx];
+    const hasCards = p.cards.length > 0 || (typeof p.cardCount === 'number' && p.cardCount > 0);
+    if (!p.isOut && hasCards) {
       return idx;
     }
   }
@@ -290,7 +340,8 @@ export function updateOutStatus(
   const newlyOut: Player[] = [];
 
   const updatedPlayers = players.map((p) => {
-    if (!p.isOut && p.cards.length === 0) {
+    const hasCards = p.cards.length > 0 || (typeof p.cardCount === 'number' && p.cardCount > 0);
+    if (!p.isOut && !hasCards) {
       if (p.id !== pickerId) {
         newlyOut.push({ ...p, isOut: true, finishPosition: nextPos });
         return { ...p, isOut: true, finishPosition: nextPos++ };

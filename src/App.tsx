@@ -16,6 +16,7 @@ import {
   canPlayCard,
   resolveCleanOutcome,
   resolveThullaOutcome,
+  determineNextLeaderAfterCleanTrick,
   getNextActivePlayerIndex,
   updateOutStatus,
   botChooseCard,
@@ -24,7 +25,7 @@ import {
 import { soundSynth } from './audio/soundSynth';
 import { CardView } from './components/CardView';
 import { PlayerSeat } from './components/PlayerSeat';
-import { TableCenter } from './components/TableCenter';
+import { TableCenter, getCardTablePosition } from './components/TableCenter';
 import type { ThullaBannerInfo, CleanBannerInfo } from './components/TableCenter';
 import { FlyingCardOverlay } from './components/FlyingCardOverlay';
 import type { FlyingCardItem } from './components/FlyingCardOverlay';
@@ -133,13 +134,13 @@ const getInitialPlayerId = (): string => {
 
 const getInitialPlayerName = (): string => {
   if (typeof window !== 'undefined') {
-    const saved = localStorage.getItem('bhabhi_player_name');
-    if (saved && saved.trim() && saved.trim() !== 'Player' && saved.trim() !== 'Player (Host)') {
-      return saved.trim();
+    const sessionSaved = sessionStorage.getItem('bhabhi_player_name');
+    if (sessionSaved && sessionSaved.trim()) {
+      return sessionSaved.trim();
     }
     const randomName = `${FUN_GUEST_NAMES[Math.floor(Math.random() * FUN_GUEST_NAMES.length)]} ${Math.floor(Math.random() * 89 + 10)}`;
     try {
-      localStorage.setItem('bhabhi_player_name', randomName);
+      sessionStorage.setItem('bhabhi_player_name', randomName);
     } catch {}
     return randomName;
   }
@@ -150,11 +151,11 @@ const AVATARS = ['😎', '🤠', '🥷', '👑', '🦁', '🦊', '🐯', '🐼',
 
 const getInitialPlayerAvatar = (): string => {
   if (typeof window !== 'undefined') {
-    const saved = localStorage.getItem('bhabhi_player_avatar');
-    if (saved && saved.trim()) return saved.trim();
+    const sessionSaved = sessionStorage.getItem('bhabhi_player_avatar');
+    if (sessionSaved && sessionSaved.trim()) return sessionSaved.trim();
     const avatar = AVATARS[Math.floor(Math.random() * AVATARS.length)] || '😎';
     try {
-      localStorage.setItem('bhabhi_player_avatar', avatar);
+      sessionStorage.setItem('bhabhi_player_avatar', avatar);
     } catch {}
     return avatar;
   }
@@ -243,13 +244,15 @@ export const App: React.FC = () => {
   })();
 
   const [roomCode, setRoomCode] = useState<string>(getInitialRoomCode);
-  const [localPlayerId] = useState<string>(getInitialPlayerId);
+  const [localPlayerId, setLocalPlayerId] = useState<string>(getInitialPlayerId);
   const [playerName, setPlayerName] = useState<string>(getInitialPlayerName);
   const [playerAvatar, setPlayerAvatar] = useState<string>(getInitialPlayerAvatar);
   const [isOnlineConnected, setIsOnlineConnected] = useState<boolean>(false);
   const [localPing, setLocalPing] = useState<number>(25);
   const [sortMode, setSortMode] = useState<SortMode>('suit');
   const [mobileLayoutMode, setMobileLayoutMode] = useState<'two-row' | 'single'>('two-row');
+  const [playerChatBubbles, setPlayerChatBubbles] = useState<Record<string, { text: string; timestamp: number }>>({});
+  const [lastPlayedCards, setLastPlayedCards] = useState<Record<string, Card>>({});
 
   const [settings, setSettings] = useState<RoomSettings>(DEFAULT_SETTINGS);
   const [gamePhase, setGamePhase] = useState<GamePhase>(() => {
@@ -300,8 +303,8 @@ export const App: React.FC = () => {
   const [cleanBanner, setCleanBanner] = useState<CleanBannerInfo | null>(null);
 
   // Seat Status Badges
-  const [cutterPlayerId, setCutterPlayerId] = useState<string | null>(null);
-  const [pickerPlayerId, setPickerPlayerId] = useState<string | null>(null);
+  const [_cutterPlayerId, setCutterPlayerId] = useState<string | null>(null);
+  const [_pickerPlayerId, setPickerPlayerId] = useState<string | null>(null);
 
 
   // Manual pickup prompt
@@ -324,6 +327,8 @@ export const App: React.FC = () => {
   ]);
 
   const botTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isSubmittingPlayRef = useRef<boolean>(false);
+  const playFlightTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   const localPlayer = useMemo((): Player => {
     const found = players.find((p) => p.id === localPlayerId);
@@ -370,12 +375,37 @@ export const App: React.FC = () => {
   themeRef.current = theme;
 
   const localPlayerRef = useRef(localPlayer);
-  localPlayerRef.current = localPlayer;
+  const lastServerSeqRef = useRef<number>(0);
+
+  const playerNameRef = useRef(playerName);
+  playerNameRef.current = playerName;
+
+  const playerAvatarRef = useRef(playerAvatar);
+  playerAvatarRef.current = playerAvatar;
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3000);
   }, []);
+
+  const triggerChatBubble = useCallback((senderId: string, text: string) => {
+    // User requirement: "show that text or emoji to that user profile card in small text menu but not for that person who send that"
+    if (senderId === localPlayerId) return;
+    setPlayerChatBubbles((prev) => ({
+      ...prev,
+      [senderId]: { text, timestamp: Date.now() },
+    }));
+    setTimeout(() => {
+      setPlayerChatBubbles((prev) => {
+        if (prev[senderId] && Date.now() - prev[senderId].timestamp >= 3800) {
+          const next = { ...prev };
+          delete next[senderId];
+          return next;
+        }
+        return prev;
+      });
+    }, 4000);
+  }, [localPlayerId]);
 
   const addChatMessage = useCallback((text: string, sender: Player, isSystem = false, shouldBroadcast = true) => {
     const newMsg: ChatMessage = {
@@ -387,13 +417,16 @@ export const App: React.FC = () => {
       timestamp: Date.now(),
     };
     setMessages((prev) => [...prev, newMsg]);
+    if (!isSystem) {
+      triggerChatBubble(sender.id, text);
+    }
     if (shouldBroadcast) {
       multiplayerService.broadcast({
         type: 'CHAT_MESSAGE',
         message: newMsg,
       });
     }
-  }, []);
+  }, [triggerChatBubble]);
 
   // Fullscreen Toggle
   const toggleFullscreen = () => {
@@ -780,13 +813,13 @@ const getPlayerSeatCoords = useCallback(
     }
 
     const count = opponents.length;
-    const arcStart = 200;
-    const arcEnd = -20;
+    const arcStart = 205;
+    const arcEnd = -25;
     const step = count > 1 ? (arcStart - arcEnd) / (count - 1) : 0;
     const currentAngleDeg = count === 1 ? 90 : arcStart - oppIndex * step;
     const currentAngleRad = (currentAngleDeg * Math.PI) / 180;
-    const radiusX = 43;
-    const radiusY = 38;
+    const radiusX = count >= 6 ? 44 : 43;
+    const radiusY = count >= 6 ? 37 : 38;
     const leftPct = 50 + radiusX * Math.cos(currentAngleRad);
     const topPct = 50 - radiusY * Math.sin(currentAngleRad);
 
@@ -823,9 +856,10 @@ const getPlayerSeatCoords = useCallback(
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [gamePhase, localPlayerId]);
 
-  // Handle Turn Timer countdown
+  // Handle Turn Timer countdown (ONLY for offline fallback; server drives countdown & auto-play when online)
   useEffect(() => {
     if (gamePhase !== 'PLAYING' || settings.turnTimerSeconds <= 0) return;
+    if (multiplayerService.isServerConnected()) return;
 
     setTurnTimeLeft(settings.turnTimerSeconds);
     const interval = setInterval(() => {
@@ -871,8 +905,45 @@ const getPlayerSeatCoords = useCallback(
           // Connected to authoritative server: send only via playCardOnServer for the local player
           if (playerId === localPlayer.id) {
             multiplayerService.playCardOnServer(card.id, (ack) => {
-              if (ack && !ack.success && ack.error) {
-                showToast(ack.error);
+              if (ack && !ack.success) {
+                if (ack.error) showToast(ack.error);
+                // 1. Cancel the optimistic landing timeout so card does not land on table felt
+                const pendingTimer = playFlightTimeoutsRef.current.get(card.id);
+                if (pendingTimer) {
+                  clearTimeout(pendingTimer);
+                  playFlightTimeoutsRef.current.delete(card.id);
+                }
+                // 2. Remove flying animation card
+                setFlyingCards((prev) => prev.filter((f) => f.card.id !== card.id));
+                // 3. Rollback optimistic hand removal
+                setPlayers((prev) =>
+                  prev.map((p) => {
+                    if (p.id === playerId && !p.cards.some((c) => c.id === card.id)) {
+                      return {
+                        ...p,
+                        cards: sortHand([...p.cards, card]),
+                        cardCount: p.cards.length + 1,
+                      };
+                    }
+                    return p;
+                  })
+                );
+                isSubmittingPlayRef.current = false;
+                setIsAnimatingPlay(false);
+
+                // 4. If card desynced from server, request immediate state refresh from server
+                if (ack.error && ack.error.includes('not in player hand')) {
+                  multiplayerService.joinRoomOnServer(
+                    roomCode,
+                    { id: localPlayerId, name: playerNameRef.current, avatar: playerAvatarRef.current },
+                    (res) => {
+                      if (res?.success && res.state) {
+                        setPlayers(res.state.players);
+                        if (res.state.currentTrick) setCurrentTrick(res.state.currentTrick);
+                      }
+                    }
+                  );
+                }
               }
             });
           }
@@ -888,18 +959,23 @@ const getPlayerSeatCoords = useCallback(
 
       setIsAnimatingPlay(true);
       setSelectedCardId(null);
+      setLastPlayedCards((prev) => ({
+        ...prev,
+        [playerId]: card,
+      }));
 
       // Start position from player's seat / hand
       const fromCoords = getPlayerSeatCoords(playerId);
-      const toCoords = { left: 50, top: 48 };
+      const activePlayers = playersRef.current.length > 0 ? playersRef.current : players;
+      const targetPos = getCardTablePosition(playerId, localPlayer.id, activePlayers);
+      const toCoords = { left: targetPos.leftPct, top: targetPos.topPct };
 
       const isLead = !currentTrick.leadSuit;
-      const isThulla = !isLead && card.suit !== currentTrick.leadSuit;
+      // User requirement: First round Thullas are ignored / passed cleanly without penalty
+      const isThulla = !isLead && card.suit !== currentTrick.leadSuit && !isFirstTrick;
 
-      // Single sound design: No sound during rotation; only play card impact sound when card lands on table!
-
-      // Launch flying card animation with weighted, smooth, clearly visible motion
-      const flightDuration = isThulla ? 1250 : 850;
+      // Launch flying card animation directly to its exact table felt spot
+      const flightDuration = isThulla ? 1100 : 750;
       const flyingId = `flight-${card.id}-${Date.now()}`;
       setFlyingCards((prev) => [
         ...prev,
@@ -910,7 +986,7 @@ const getPlayerSeatCoords = useCallback(
           to: toCoords,
           durationMs: flightDuration,
           startRotation: 0,
-          endRotation: isThulla ? 1080 : Math.floor(Math.random() * 20 - 10),
+          endRotation: targetPos.rotationDeg,
           isThulla,
         },
       ]);
@@ -926,7 +1002,10 @@ const getPlayerSeatCoords = useCallback(
       setPlayers(updatedPlayers);
 
       // After flight lands on table:
-      setTimeout(() => {
+      const flightTimer = setTimeout(() => {
+        playFlightTimeoutsRef.current.delete(card.id);
+        isSubmittingPlayRef.current = false;
+
         if (isThulla) {
           soundSynth.playThullaBoom();
         } else {
@@ -948,13 +1027,19 @@ const getPlayerSeatCoords = useCallback(
         };
 
         setCurrentTrick(updatedTrick);
+        setIsAnimatingPlay(false);
 
         if (updatedHand.length === 1) {
           soundSynth.playWarningAlarm();
         }
 
+        // When connected to authoritative server, server resolves trick outcomes and broadcasts state
+        if (multiplayerService.isServerConnected()) {
+          return;
+        }
+
         // ==========================================
-        // CASE 1: THULLA CUT OCCURRED!
+        // OFFLINE FALLBACK: LOCAL TRICK RESOLUTION
         // ==========================================
         if (isThulla) {
           const { pickerId, pickedCards } = resolveThullaOutcome(updatedTrick, settings.tieRule);
@@ -974,12 +1059,6 @@ const getPlayerSeatCoords = useCallback(
             pickedCount: pickedCards.length,
           };
           setThullaBanner(bannerInfo);
-
-          addChatMessage(
-            `💥 THULLA! ${player.name} cut with ${card.rank} of ${card.suit}! ${picker?.name} takes ${pickedCards.length} cards!`,
-            player,
-            true
-          );
 
           const finalizeThulla = () => {
             const pickerCoords = getPlayerSeatCoords(pickerId);
@@ -1103,13 +1182,12 @@ const getPlayerSeatCoords = useCallback(
                 return;
               }
 
-              const currentWinner = postOutPlayers.find((p) => p.id === winnerId);
-              let nextLeaderId = winnerId;
-              if (!currentWinner || currentWinner.isOut || currentWinner.cards.length === 0) {
-                const winnerIndex = postOutPlayers.findIndex((p) => p.id === winnerId);
-                const nextActiveIdx = getNextActivePlayerIndex(postOutPlayers, winnerIndex);
-                nextLeaderId = postOutPlayers[nextActiveIdx].id;
-              }
+              const nextLeaderId = determineNextLeaderAfterCleanTrick(
+                updatedTrick,
+                postOutPlayers,
+                winnerId,
+                settings.tieRule
+              );
 
               setIsFirstTrick(false);
               setPlayers(postOutPlayers);
@@ -1132,6 +1210,7 @@ const getPlayerSeatCoords = useCallback(
           }
         }
       }, flightDuration);
+      playFlightTimeoutsRef.current.set(card.id, flightTimer);
     },
     [
       isAnimatingPlay,
@@ -1314,6 +1393,32 @@ const getPlayerSeatCoords = useCallback(
           break;
         }
 
+        case 'RETURN_TO_LOBBY': {
+          setGamePhase('LOBBY');
+          gamePhaseRef.current = 'LOBBY';
+          setBhabhiPlayer(null);
+          setDeadPile([]);
+          deadPileRef.current = [];
+          setCurrentTrick({ leadSuit: null, plays: [] });
+          currentTrickRef.current = { leadSuit: null, plays: [] };
+          setThullaBanner(null);
+          setCleanBanner(null);
+          setCutterPlayerId(null);
+          setPickerPlayerId(null);
+          setIsDiscardingTrick(false);
+          setPlayers((prev) =>
+            prev.map((p) => ({
+              ...p,
+              cards: [],
+              cardCount: 0,
+              isOut: false,
+              finishPosition: null,
+            }))
+          );
+          showToast('Returned to Lobby');
+          break;
+        }
+
         case 'GAME_START': {
           setPlayers(event.players);
           playersRef.current = event.players;
@@ -1430,6 +1535,10 @@ const getPlayerSeatCoords = useCallback(
         }
 
         case 'CARD_PLAYED_ANIMATION': {
+          setLastPlayedCards((prev) => ({
+            ...prev,
+            [event.playerId]: event.card,
+          }));
           if (event.playerId !== localPlayerId) {
             // 1. Visually remove the card from the opponent's hand immediately
             setPlayers((prev) =>
@@ -1449,10 +1558,12 @@ const getPlayerSeatCoords = useCallback(
               })
             );
 
-            // 2. Launch smooth flight animation from opponent seat to table center
+            // 2. Launch smooth flight animation from opponent seat directly to table card spot
             const fromCoords = getPlayerSeatCoords(event.playerId);
-            const toCoords = { left: 50, top: 48 };
-            const flightDuration = event.isThulla ? 1250 : 850;
+            const activePlayers = playersRef.current.length > 0 ? playersRef.current : players;
+            const targetPos = getCardTablePosition(event.playerId, localPlayerId, activePlayers);
+            const toCoords = { left: targetPos.leftPct, top: targetPos.topPct };
+            const flightDuration = event.isThulla ? 1100 : 750;
             const flyingId = `flight-${event.card.id}-${Date.now()}`;
 
             setFlyingCards((prev) => [
@@ -1464,7 +1575,7 @@ const getPlayerSeatCoords = useCallback(
                 to: toCoords,
                 durationMs: flightDuration,
                 startRotation: 0,
-                endRotation: event.isThulla ? 1080 : Math.floor(Math.random() * 20 - 10),
+                endRotation: targetPos.rotationDeg,
                 isThulla: event.isThulla,
               },
             ]);
@@ -1493,7 +1604,7 @@ const getPlayerSeatCoords = useCallback(
             cutterName: event.cutterName,
             pickerName: event.pickerName,
             cutCard: event.cutCard,
-            highestLeadCard: event.cutCard,
+            highestLeadCard: event.highestLeadCard || undefined,
             pickedCount: event.pickedCount,
           });
 
@@ -1501,12 +1612,6 @@ const getPlayerSeatCoords = useCallback(
           if (event.cutterId !== localPlayerId) {
             soundSynth.playThullaBoom();
           }
-
-          addChatMessage(
-            `💥 THULLA! ${event.cutterName} cut with ${event.cutCard.rank} of ${event.cutCard.suit}! ${event.pickerName} takes ${event.pickedCount} cards!`,
-            playersRef.current.find((p) => p.id === event.cutterId) || localPlayerRef.current,
-            true
-          );
 
           // After displaying the banner, smoothly fly all table cards to the picker's seat
           setTimeout(() => {
@@ -1580,7 +1685,43 @@ const getPlayerSeatCoords = useCallback(
           break;
         }
 
+        case 'CHAT_MESSAGE': {
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === event.message.id)) return prev;
+            // Prevent double-message for the local sender who already appended locally
+            if (event.message.senderId === localPlayerId) {
+              const localDuplicate = prev.find(
+                (m) =>
+                  m.senderId === localPlayerId &&
+                  m.text === event.message.text &&
+                  Math.abs(m.timestamp - event.message.timestamp) < 5000
+              );
+              if (localDuplicate) {
+                return prev.map((m) => (m === localDuplicate ? { ...m, id: event.message.id } : m));
+              }
+            }
+            return [...prev, event.message];
+          });
+          triggerChatBubble(event.message.senderId, event.message.text);
+          break;
+        }
+
         case 'SYNC_FULL_STATE': {
+          if (event.state?.currentTrick?.plays) {
+            event.state.currentTrick.plays.forEach((p: any) => {
+              if (p?.playerId && p?.card) {
+                setLastPlayedCards((prev) => ({ ...prev, [p.playerId]: p.card }));
+              }
+            });
+          }
+          if (event.sequenceNumber && event.sequenceNumber < lastServerSeqRef.current) {
+            // Stale out-of-order update, ignore
+            return;
+          }
+          if (event.sequenceNumber) {
+            lastServerSeqRef.current = event.sequenceNumber;
+          }
+
           if (event.toast) {
             showToast(event.toast);
           }
@@ -1592,7 +1733,7 @@ const getPlayerSeatCoords = useCallback(
           let updatedList: Player[] = incoming.map((p): Player => {
             if (p.id === localPlayerId) {
               const currentLocalCards = playersRef.current.find((pl) => pl.id === localPlayerId)?.cards || [];
-              const serverCards = p.cards && p.cards.length > 0 ? p.cards : currentLocalCards;
+              const serverCards = p.cards !== undefined ? p.cards : currentLocalCards;
               return {
                 ...p,
                 cards: serverCards,
@@ -1636,6 +1777,18 @@ const getPlayerSeatCoords = useCallback(
           deadPileRef.current = event.state.deadPile || [];
           setIsFirstTrick(event.state.isFirstTrick ?? false);
           isFirstTrickRef.current = event.state.isFirstTrick ?? false;
+
+          if (event.state.bhabhiPlayer) {
+            setBhabhiPlayer(event.state.bhabhiPlayer);
+          } else if (event.state.gamePhase === 'GAME_OVER') {
+            const loser =
+              updatedList.find((p) => !p.isOut && ((p.cardCount ?? 0) > 0 || (p.cards && p.cards.length > 0))) ||
+              updatedList.find((p) => !p.finishPosition) ||
+              updatedList[updatedList.length - 1];
+            if (loser) setBhabhiPlayer(loser);
+          } else if (event.state.gamePhase === 'LOBBY') {
+            setBhabhiPlayer(null);
+          }
 
           if (event.state.gamePhase && event.state.gamePhase !== gamePhaseRef.current) {
             setGamePhase(event.state.gamePhase);
@@ -1708,9 +1861,12 @@ const getPlayerSeatCoords = useCallback(
     }
   }, [players, gamePhase, settings.voiceEnabled]);
 
-  // Connect multiplayer service to room topic (stable, does not disconnect on trick changes)
+  // Connect multiplayer service to room topic (stable, does not disconnect on trick changes or phase transitions)
   useEffect(() => {
-    if (gamePhase === 'HOME') return;
+    if (gamePhase === 'HOME') {
+      multiplayerService.disconnect();
+      return;
+    }
 
     const stableHandler = (event: NetworkEvent) => {
       networkEventHandlerRef.current?.(event);
@@ -1718,22 +1874,6 @@ const getPlayerSeatCoords = useCallback(
 
     multiplayerService.connect(roomCode, stableHandler, setIsOnlineConnected);
     multiplayerService.startHeartbeat(localPlayerId);
-
-    const cleanLocalPlayer = (): Player => ({
-      id: localPlayerId,
-      name: playerName,
-      avatar: playerAvatar,
-      isBot: false,
-      cards: [],
-      seatIndex: 0,
-      isHost: isHostForRoom(roomCode),
-      isReady: true,
-      isOut: false,
-      finishPosition: null,
-      consecutiveTimeouts: 0,
-      isOnline: true,
-      ping: localPing,
-    });
 
     const unsubPing = multiplayerService.onPingChange((p) => {
       setLocalPing(p);
@@ -1745,66 +1885,51 @@ const getPlayerSeatCoords = useCallback(
     const unsubConnect = multiplayerService.onConnect(() => {
       multiplayerService.joinRoomOnServer(
         roomCode,
-        { id: localPlayerId, name: playerName, avatar: playerAvatar },
+        { id: localPlayerId, name: playerNameRef.current, avatar: playerAvatarRef.current },
         (res) => {
           if (res?.success && res.state) {
+            if (res.player && res.player.id && res.player.id !== localPlayerId) {
+              setLocalPlayerId(res.player.id);
+              try {
+                localStorage.setItem('bhabhi_player_id', res.player.id);
+              } catch {}
+              multiplayerService.startHeartbeat(res.player.id);
+            }
             setPlayers(res.state.players);
             if (res.state.gamePhase) setGamePhase(res.state.gamePhase);
+            if (res.state.bhabhiPlayer) setBhabhiPlayer(res.state.bhabhiPlayer);
+            if (res.state.currentTrick) setCurrentTrick(res.state.currentTrick);
           }
         }
       );
-      multiplayerService.broadcast({
-        type: 'PLAYER_JOIN',
-        player: cleanLocalPlayer(),
-      });
-      multiplayerService.broadcast({
-        type: 'REQUEST_SYNC',
-        requesterId: localPlayerId,
-      });
-    });
-
-    multiplayerService.broadcast({
-      type: 'PLAYER_JOIN',
-      player: cleanLocalPlayer(),
-    });
-    multiplayerService.broadcast({
-      type: 'REQUEST_SYNC',
-      requesterId: localPlayerId,
     });
 
     // Mobile Phone Screen Wake / App Switch Reconnect Listener
     const handleWakeOrFocus = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-        console.log('[Multiplayer] Resumed / Focused - reconnecting & announcing presence');
-        multiplayerService.reconnect();
-        multiplayerService.broadcast({
-          type: 'PLAYER_RECONNECT',
-          playerId: localPlayerId,
-        });
-        multiplayerService.broadcast({
-          type: 'PLAYER_JOIN',
-          player: cleanLocalPlayer(),
-        });
-        multiplayerService.broadcast({
-          type: 'REQUEST_SYNC',
-          requesterId: localPlayerId,
-        });
-
-        // If host, immediately broadcast authoritative state so guests wake up with current room
-        if (isHostForRoom(roomCode)) {
-          multiplayerService.broadcast({
-            type: 'SYNC_FULL_STATE',
-            state: {
-              players: playersRef.current,
-              currentTurnPlayerId: currentTurnPlayerIdRef.current,
-              currentTrick: currentTrickRef.current,
-              deadPile: deadPileRef.current,
-              gamePhase: gamePhaseRef.current,
-              isFirstTrick: isFirstTrickRef.current,
-              settings: settingsRef.current,
-              theme: themeRef.current,
-            },
-          });
+        console.log('[Multiplayer] Resumed / Focused - reconnecting with server');
+        if (multiplayerService.isServerConnected()) {
+          multiplayerService.joinRoomOnServer(
+            roomCode,
+            { id: localPlayerId, name: playerNameRef.current, avatar: playerAvatarRef.current },
+            (res) => {
+              if (res?.success && res.state) {
+                if (res.player && res.player.id && res.player.id !== localPlayerId) {
+                  setLocalPlayerId(res.player.id);
+                  try {
+                    localStorage.setItem('bhabhi_player_id', res.player.id);
+                  } catch {}
+                  multiplayerService.startHeartbeat(res.player.id);
+                }
+                setPlayers(res.state.players);
+                if (res.state.gamePhase) setGamePhase(res.state.gamePhase);
+                if (res.state.bhabhiPlayer) setBhabhiPlayer(res.state.bhabhiPlayer);
+                if (res.state.currentTrick) setCurrentTrick(res.state.currentTrick);
+              }
+            }
+          );
+        } else {
+          multiplayerService.reconnect();
         }
       }
     };
@@ -1821,13 +1946,12 @@ const getPlayerSeatCoords = useCallback(
       unsubConnect();
       multiplayerService.disconnect();
     };
-  }, [roomCode, localPlayerId, playerName, playerAvatar, gamePhase]);
+  }, [roomCode, localPlayerId, gamePhase === 'HOME']);
 
-  // Continuous sync & presence in Lobby:
-  // - Host continuously broadcasts full state every 2.5s so any newly connected phone or guest is immediately synced.
-  // - Guest continuously announces presence every 2s until room has confirmed host and players!
+  // Continuous sync & presence in Lobby (ONLY for offline/P2P fallback; server handles presence when connected):
   useEffect(() => {
     if (gamePhase !== 'LOBBY') return;
+    if (multiplayerService.isServerConnected()) return;
 
     const interval = setInterval(() => {
       if (isHostForRoom(roomCode)) {
@@ -1872,12 +1996,25 @@ const getPlayerSeatCoords = useCallback(
     return () => clearInterval(interval);
   }, [gamePhase, localPlayerId, playerName, playerAvatar, roomCode]);
 
-  // Deal and start game (Host broadcasts to all players across internet)
+  // Deal and start game
   const handleStartGame = () => {
     if (players.length < 2) {
       showToast('At least 2 players are required to start!');
       return;
     }
+
+    // When connected to authoritative server, let server deal cards to prevent dual-deal desync!
+    if (multiplayerService.isServerConnected()) {
+      multiplayerService.broadcast({
+        type: 'GAME_START',
+        players: [],
+        startingPlayerId: '',
+        trick: { leadSuit: null, plays: [] },
+      });
+      return;
+    }
+
+    // Offline / hotseat fallback: deal locally
     const deckCountToUse = players.length >= 7 ? 2 : settings.deckCount;
     const { dealtPlayers } = dealCards(players, deckCountToUse, settings.equalHands);
 
@@ -1954,7 +2091,7 @@ const getPlayerSeatCoords = useCallback(
 
   // Local card click
   const handleLocalCardClick = (card: Card) => {
-    if (isAnimatingPlay) return;
+    if (isSubmittingPlayRef.current || isAnimatingPlay) return;
     if (localPlayer.isOut || localPlayer.cards.length === 0) return;
 
     if (currentTurnPlayerId !== localPlayer.id) {
@@ -1970,6 +2107,7 @@ const getPlayerSeatCoords = useCallback(
     }
 
     // SINGLE TAP TO PLAY: Immediately send card to table without dual click!
+    isSubmittingPlayRef.current = true;
     executePlayCard(localPlayer.id, card, true);
   };
 
@@ -1979,7 +2117,8 @@ const getPlayerSeatCoords = useCallback(
       const prevPlayers = playersRef.current;
       const giver = prevPlayers.find((p) => p.id === giverId);
       const receiver = prevPlayers.find((p) => p.id === receiverId);
-      if (!giver || giver.cards.length === 0 || !receiver) return;
+      const giverCount = giver?.cards?.length ?? giver?.cardCount ?? 0;
+      if (!giver || giverCount === 0 || !receiver) return;
 
       const cardsToTransfer = [...giver.cards];
       const postTransferPlayers = prevPlayers.map((p) => {
@@ -1988,7 +2127,8 @@ const getPlayerSeatCoords = useCallback(
         }
         if (p.id === receiverId) {
           const combined = sortHand([...p.cards, ...cardsToTransfer]);
-          return { ...p, cards: combined, cardCount: combined.length, isOut: false, finishPosition: null };
+          const newCount = p.cards.length > 0 || cardsToTransfer.length > 0 ? combined.length : (p.cardCount || 0) + giverCount;
+          return { ...p, cards: combined, cardCount: newCount, isOut: false, finishPosition: null };
         }
         return p;
       });
@@ -2010,7 +2150,7 @@ const getPlayerSeatCoords = useCallback(
       }
 
       // Check if Game Over: only 1 or 0 players left with cards!
-      const remainingWithCards = postOutPlayers.filter((p) => !p.isOut && p.cards.length > 0);
+      const remainingWithCards = postOutPlayers.filter((p) => !p.isOut && (p.cards.length > 0 || (p.cardCount ?? 0) > 0));
       if (remainingWithCards.length <= 1) {
         const loser = remainingWithCards[0] || receiver;
         setBhabhiPlayer(loser);
@@ -2038,7 +2178,8 @@ const getPlayerSeatCoords = useCallback(
       // If game continues, check if current turn was the giver (or anyone who now has 0 cards / is out)
       let nextTurnId = forcedNextTurnId || currentTurnPlayerIdRef.current;
       const currentTurnPlayer = postOutPlayers.find((p) => p.id === nextTurnId);
-      if (!forcedNextTurnId && (!currentTurnPlayer || currentTurnPlayer.isOut || currentTurnPlayer.cards.length === 0)) {
+      const currentTurnHasCards = currentTurnPlayer && !currentTurnPlayer.isOut && (currentTurnPlayer.cards.length > 0 || (currentTurnPlayer.cardCount ?? 0) > 0);
+      if (!forcedNextTurnId && (!currentTurnPlayer || currentTurnPlayer.isOut || !currentTurnHasCards)) {
         const giverIdx = postOutPlayers.findIndex((p) => p.id === giverId);
         const nextIdx = getNextActivePlayerIndex(postOutPlayers, giverIdx >= 0 ? giverIdx : 0);
         const nextPlayer = postOutPlayers[nextIdx];
@@ -2084,13 +2225,26 @@ const getPlayerSeatCoords = useCallback(
   // Request to transfer all local player cards to target player
   const handleGiveAllCards = (targetPlayer: Player) => {
     if (localPlayer.cards.length === 0) return;
+    if (currentTurnPlayerId === localPlayer.id) {
+      showToast('Cannot give cards while it is your turn to play!');
+      return;
+    }
 
     if (targetPlayer.isBot) {
       showToast(`Transferring cards to ${targetPlayer.name}...`);
       setTimeout(() => {
-        executeDirectTransfer(localPlayer.id, targetPlayer.id);
-        showToast(`${targetPlayer.name} accepted your cards!`);
-      }, 400);
+        if (multiplayerService.isServerConnected()) {
+          multiplayerService.broadcast({
+            type: 'TAKE_OR_GIVE_CARDS',
+            fromPlayerId: localPlayer.id,
+            toPlayerId: targetPlayer.id,
+            cards: localPlayer.cards,
+          });
+        } else {
+          executeDirectTransfer(localPlayer.id, targetPlayer.id);
+        }
+        showToast(`${targetPlayer.name} received your cards!`);
+      }, 300);
       return;
     }
 
@@ -2118,14 +2272,27 @@ const getPlayerSeatCoords = useCallback(
 
   // Request to take all cards from target player into local player's hand
   const handleTakePlayerCards = (targetPlayer: Player) => {
-    if (targetPlayer.cards.length === 0) return;
+    const oppCardCount = typeof targetPlayer.cardCount === 'number' ? targetPlayer.cardCount : targetPlayer.cards.length;
+    if (oppCardCount === 0) {
+      showToast(`${targetPlayer.name} has no cards left!`);
+      return;
+    }
 
     if (targetPlayer.isBot) {
       showToast(`Taking cards from ${targetPlayer.name}...`);
       setTimeout(() => {
-        executeDirectTransfer(targetPlayer.id, localPlayer.id);
+        if (multiplayerService.isServerConnected()) {
+          multiplayerService.broadcast({
+            type: 'TAKE_OR_GIVE_CARDS',
+            fromPlayerId: targetPlayer.id,
+            toPlayerId: localPlayer.id,
+            cards: [],
+          });
+        } else {
+          executeDirectTransfer(targetPlayer.id, localPlayer.id);
+        }
         showToast(`${targetPlayer.name} transferred cards to you!`);
-      }, 400);
+      }, 300);
       return;
     }
 
@@ -2139,7 +2306,7 @@ const getPlayerSeatCoords = useCallback(
       toPlayerId: targetPlayer.id,
       toPlayerName: targetPlayer.name,
       action: 'TAKE',
-      cardCount: targetPlayer.cards.length,
+      cardCount: oppCardCount,
     });
 
     showToast(`📨 Sent request to take cards from ${targetPlayer.name}. Waiting for approval...`);
@@ -2150,6 +2317,32 @@ const getPlayerSeatCoords = useCallback(
       false
     );
   };
+
+  const handleReturnToLobby = useCallback(() => {
+    setGamePhase('LOBBY');
+    gamePhaseRef.current = 'LOBBY';
+    setBhabhiPlayer(null);
+    setDeadPile([]);
+    deadPileRef.current = [];
+    setCurrentTrick({ leadSuit: null, plays: [] });
+    currentTrickRef.current = { leadSuit: null, plays: [] };
+    setPlayers((prev) =>
+      prev.map((p) => ({
+        ...p,
+        cards: [],
+        cardCount: 0,
+        isOut: false,
+        finishPosition: null,
+      }))
+    );
+    if (multiplayerService.isServerConnected()) {
+      multiplayerService.returnToLobbyOnServer();
+    }
+    multiplayerService.broadcast({
+      type: 'RETURN_TO_LOBBY',
+      requesterId: localPlayerId,
+    });
+  }, [localPlayerId]);
 
   const handleAcceptTransferRequest = (req: TransferRequestInfo) => {
     multiplayerService.broadcast({
@@ -2197,14 +2390,16 @@ const getPlayerSeatCoords = useCallback(
     }
   };
 
-  // Add / Remove Bots
+  // Add / Remove Bots (Optimistic instant response to eliminate lag)
   const handleAddBot = (difficulty: BotDifficulty) => {
-    if (players.length >= settings.maxPlayers) return;
+    if (players.length >= (settings.maxPlayers || 8)) return;
+    const botNames = ['Bot Vicky', 'Bot Sunny', 'Bot Simran', 'Bot Bunty', 'Bot Preet', 'Bot Rocky', 'Bot Priya', 'Bot Kabir'];
     const botNum = players.filter((p) => p.isBot).length + 1;
+    const name = botNames[(botNum - 1) % botNames.length] || `Bot ${botNum}`;
     const botAvatar = AVATARS[players.length % AVATARS.length];
-    const newBot: Player = {
-      id: `bot-${Date.now()}-${botNum}`,
-      name: `Bot ${botNum} (${difficulty})`,
+    const optimisticBot: Player = {
+      id: `bot-opt-${Date.now()}-${botNum}`,
+      name: `${name} (${difficulty})`,
       avatar: botAvatar,
       isBot: true,
       botDifficulty: difficulty,
@@ -2215,8 +2410,21 @@ const getPlayerSeatCoords = useCallback(
       isOut: false,
       finishPosition: null,
       consecutiveTimeouts: 0,
+      isOnline: true,
+      ping: Math.floor(Math.random() * 10) + 6,
     };
-    setPlayers([...players, newBot]);
+
+    // Instant local state update
+    setPlayers((prev) => [...prev, optimisticBot]);
+
+    if (multiplayerService.isServerConnected()) {
+      multiplayerService.addBotOnServer(difficulty, (res) => {
+        if (!res?.success && res?.error) {
+          showToast(res.error);
+          setPlayers((prev) => prev.filter((p) => p.id !== optimisticBot.id));
+        }
+      });
+    }
   };
 
   const handleRemovePlayer = (id: string) => {
@@ -2224,12 +2432,23 @@ const getPlayerSeatCoords = useCallback(
       showToast('Minimum 2 players required!');
       return;
     }
-    setPlayers(players.filter((p) => p.id !== id));
+    // Instant local removal
+    setPlayers((prev) => {
+      const remaining = prev.filter((p) => p.id !== id);
+      return remaining.map((p, i) => ({ ...p, seatIndex: i }));
+    });
+    if (multiplayerService.isServerConnected()) {
+      multiplayerService.removePlayerOnServer(id, (res) => {
+        if (!res?.success && res?.error) {
+          showToast(res.error);
+        }
+      });
+    }
   };
 
-  // Sort local player's cards according to chosen SortMode
+  // User requirement: "and alowas sort the card in suit wise"
   const sortedLocalCards = useMemo(() => {
-    return sortHand(localPlayer.cards, sortMode);
+    return sortHand(localPlayer.cards, sortMode || 'suit');
   }, [localPlayer.cards, sortMode]);
   const cardCount = sortedLocalCards.length;
   const isMobile = windowWidth < 640;
@@ -2509,6 +2728,7 @@ const getPlayerSeatCoords = useCallback(
                 cleanBanner={cleanBanner}
                 isDiscarding={isDiscardingTrick}
                 flyingCardIds={flyingCardIds}
+                localPlayerId={localPlayer.id}
               />
 
               {/* Big Centered WiFi Warning Overlay for High Ping / Connection Drops */}
@@ -2521,22 +2741,15 @@ const getPlayerSeatCoords = useCallback(
               {/* OPPONENTS AROUND THE ELLIPSE IN GUARANTEED CLOCKWISE SEQUENCE */}
               {getClockwiseOpponents(players, localPlayer.id).map((opp, oppIndex, oppArr) => {
                   const count = oppArr.length;
-                  const arcStart = 200;
-                  const arcEnd = -20;
+                  const arcStart = 205;
+                  const arcEnd = -25;
                   const step = count > 1 ? (arcStart - arcEnd) / (count - 1) : 0;
                   const currentAngleDeg = count === 1 ? 90 : arcStart - oppIndex * step;
                   const currentAngleRad = (currentAngleDeg * Math.PI) / 180;
-                  const radiusX = 43;
-                  const radiusY = 38;
+                  const radiusX = count >= 6 ? 44 : 43;
+                  const radiusY = count >= 6 ? 37 : 38;
                   const leftPct = 50 + radiusX * Math.cos(currentAngleRad);
                   const topPct = 50 - radiusY * Math.sin(currentAngleRad);
-
-                  let statusBadge: { label: string; color: 'red' | 'amber' | 'emerald' | 'blue' } | null = null;
-                  if (opp.id === cutterPlayerId) {
-                    statusBadge = { label: '💥 CUTTER', color: 'red' };
-                  } else if (opp.id === pickerPlayerId) {
-                    statusBadge = { label: '📦 TAKES PILE', color: 'amber' };
-                  }
 
                   return (
                     <div
@@ -2553,9 +2766,11 @@ const getPlayerSeatCoords = useCallback(
                         timeLeft={turnTimeLeft}
                         totalTime={settings.turnTimerSeconds}
                         theme={theme}
-                        statusBadge={statusBadge}
-                        canRename={localPlayer.isHost}
+                        statusBadge={null}
+                        canRename={false}
                         onRename={() => setRenameTargetPlayer(opp)}
+                        chatBubble={playerChatBubbles[opp.id] || null}
+                        lastPlayedCard={lastPlayedCards[opp.id] || null}
                       />
                     </div>
                   );
@@ -2568,64 +2783,65 @@ const getPlayerSeatCoords = useCallback(
             className="relative z-30 max-w-4xl mx-auto w-full flex flex-col items-center flex-shrink-0 pb-3 sm:pb-1"
             style={{ paddingBottom: 'max(10px, env(safe-area-inset-bottom))' }}
           >
-            {/* Turn Prompt or Play Action Button + Eye Toggle */}
-            <div className="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 mb-1">
-              {/* Eye Button to toggle Hand Visibility for privacy with auto-unhide on turn and auto-rehide when turn ends! */}
-              <button
-                onClick={togglePrivacyMode}
-                className="p-1 px-2 sm:p-1.5 sm:px-2.5 rounded-full bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white border border-white/10 transition shadow flex items-center gap-1 sm:gap-1.5 text-[10px] sm:text-xs font-bold cursor-pointer"
-                title={privacyMode ? 'Privacy Mode ON (Auto-hides cards)' : 'Privacy Mode OFF'}
-              >
-                {privacyMode && isHandHidden ? (
-                  <Eye className="w-3 sm:w-3.5 h-3 sm:h-3.5 text-amber-400" />
-                ) : (
-                  <EyeOff className="w-3 sm:w-3.5 h-3 sm:h-3.5 text-slate-400" />
-                )}
-                <span>{privacyMode && isHandHidden ? 'Cards Hidden' : 'Privacy Mode'}</span>
-              </button>
-
-              {/* Take Cards Button with Swap Icon placed near hand cards */}
-              <button
-                onClick={() => setShowTakeModal(true)}
-                className="p-1 px-2.5 sm:p-1.5 sm:px-3 rounded-full bg-slate-900/90 hover:bg-slate-800 text-amber-300 hover:text-white border border-amber-500/40 hover:border-amber-400 transition shadow flex items-center gap-1 sm:gap-1.5 text-[10px] sm:text-xs font-bold cursor-pointer active:scale-95"
-                title="Send request to take or swap cards with an opponent"
-              >
-                <ArrowLeftRight className="w-3 sm:w-3.5 h-3 sm:h-3.5 text-amber-400" />
-                <span>Take Cards</span>
-              </button>
-
+            {/* Top Action & Turn Toolbar: Perfectly balanced and responsive on mobile */}
+            <div className="w-full max-w-md px-2 flex items-center justify-between gap-1.5 mb-1.5 select-none">
+              {/* Turn Status Banner */}
               {isMyTurn ? (
-                <div className="flex items-center gap-1.5">
-                  <span className="px-2.5 sm:px-3.5 py-0.5 sm:py-1 bg-gradient-to-r from-amber-500 via-amber-400 to-yellow-400 text-slate-950 font-black text-[10px] sm:text-xs uppercase tracking-wider rounded-full shadow-lg flex items-center gap-1.5 animate-pulse">
-                    <Sparkles className="w-3 sm:w-3.5 h-3 sm:h-3.5 text-slate-950" />
-                    <span>Your Turn! Tap card to play</span>
-                    {turnTimeLeft > 0 && (
-                      <span className={`px-2 py-0.5 rounded-full font-black text-[10px] sm:text-xs ml-1 border ${
-                        turnTimeLeft <= 5 
-                          ? 'bg-rose-600 text-white border-rose-300 animate-bounce' 
-                          : 'bg-black/80 text-amber-300 border-amber-500/50'
-                      }`}>
-                        ⏱️ {turnTimeLeft}s left
-                      </span>
-                    )}
-                  </span>
+                <div className="flex-1 flex items-center justify-between px-3 py-1 bg-gradient-to-r from-amber-500 via-amber-400 to-yellow-400 text-slate-950 font-black text-[10px] sm:text-xs uppercase tracking-wider rounded-full shadow-lg animate-pulse min-w-0">
+                  <div className="flex items-center gap-1.5 truncate">
+                    <Sparkles className="w-3.5 h-3.5 text-slate-950 flex-shrink-0" />
+                    <span className="truncate">Your Turn! Tap card</span>
+                  </div>
+                  {turnTimeLeft > 0 && (
+                    <span className={`px-1.5 py-0.5 rounded-full font-black text-[10px] ml-1 border flex-shrink-0 ${
+                      turnTimeLeft <= 5 
+                        ? 'bg-rose-600 text-white border-rose-300 animate-bounce' 
+                        : 'bg-black/80 text-amber-300 border-amber-500/50'
+                    }`}>
+                      ⏱️ {turnTimeLeft}s
+                    </span>
+                  )}
                 </div>
               ) : (
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[9px] sm:text-[11px] font-semibold text-slate-300 bg-slate-950/70 px-2.5 sm:px-3 py-0.5 rounded-full border border-white/10 flex items-center gap-1.5 shadow-md">
-                    <span>Awaiting {players.find((p) => p.id === currentTurnPlayerId)?.name || 'opponent'}&apos;s move...</span>
-                    {turnTimeLeft > 0 && (
-                      <span className={`px-1.5 py-0.5 rounded-full font-mono font-bold text-[10px] border ${
-                        turnTimeLeft <= 5 
-                          ? 'bg-rose-500/80 text-white border-rose-300 animate-pulse' 
-                          : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                      }`}>
-                        ⏱️ {turnTimeLeft}s left
-                      </span>
-                    )}
-                  </span>
+                <div className="flex-1 flex items-center justify-between px-3 py-1 text-[10px] sm:text-[11px] font-semibold text-slate-300 bg-slate-950/80 rounded-full border border-white/10 shadow-md min-w-0">
+                  <span className="truncate">Awaiting {players.find((p) => p.id === currentTurnPlayerId)?.name || 'opponent'}...</span>
+                  {turnTimeLeft > 0 && (
+                    <span className={`px-1.5 py-0.5 rounded-full font-mono font-bold text-[9px] border flex-shrink-0 ml-1 ${
+                      turnTimeLeft <= 5 
+                        ? 'bg-rose-500/80 text-white border-rose-300 animate-pulse' 
+                        : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                    }`}>
+                      ⏱️ {turnTimeLeft}s
+                    </span>
+                  )}
                 </div>
               )}
+
+              {/* Action Buttons: Privacy Mode & Take Cards */}
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button
+                  onClick={togglePrivacyMode}
+                  className="p-1 px-2 rounded-full bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white border border-white/10 transition shadow flex items-center gap-1 text-[10px] font-bold cursor-pointer"
+                  title={privacyMode ? 'Privacy Mode ON (Auto-hides cards)' : 'Privacy Mode OFF'}
+                >
+                  {privacyMode && isHandHidden ? (
+                    <Eye className="w-3.5 h-3.5 text-amber-400" />
+                  ) : (
+                    <EyeOff className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                  <span className="hidden xs:inline sm:inline">{privacyMode && isHandHidden ? 'Hidden' : 'Privacy'}</span>
+                </button>
+
+                <button
+                  onClick={() => setShowTakeModal(true)}
+                  disabled={cardCount === 0 || !players.some((p) => p.id !== localPlayer.id && !p.isOut && ((typeof p.cardCount === 'number' ? p.cardCount : p.cards.length) > 0))}
+                  className="p-1 px-2.5 rounded-full bg-slate-900/90 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-amber-300 hover:text-white border border-amber-500/40 hover:border-amber-400 transition shadow flex items-center gap-1 text-[10px] font-bold cursor-pointer active:scale-95"
+                  title={cardCount === 0 ? "You have no cards" : "Send request to take or swap cards with an opponent"}
+                >
+                  <ArrowLeftRight className="w-3 h-3 text-amber-400" />
+                  <span>Take</span>
+                </button>
+              </div>
             </div>
 
             {/* Mobile Hand Overview & Sort UI (No Filters, Zero Scrollbar, 100% on Screen) */}
@@ -2690,7 +2906,9 @@ const getPlayerSeatCoords = useCallback(
                   >
                     <ArrowUpDown className="w-3 h-3 text-amber-400" />
                     <span>
-                      {sortMode === 'suit'
+                      {sortMode === 'none'
+                        ? 'Sort: Natural'
+                        : sortMode === 'suit'
                         ? 'Sort: ♠ Suit'
                         : sortMode === 'rank-desc'
                         ? 'Sort: High-Low'
@@ -2896,6 +3114,7 @@ const getPlayerSeatCoords = useCallback(
         onClose={() => setShowTakeModal(false)}
         players={players}
         localPlayer={localPlayer}
+        isMyTurn={currentTurnPlayerId === localPlayer.id}
         onGiveCards={handleGiveAllCards}
         onTakeCards={handleTakePlayerCards}
       />
@@ -2946,7 +3165,7 @@ const getPlayerSeatCoords = useCallback(
           bhabhiPlayer={bhabhiPlayer}
           neutralNames={settings.neutralNames}
           onRematch={handleStartGame}
-          onLobby={() => setGamePhase('LOBBY')}
+          onLobby={handleReturnToLobby}
           onHome={handleGoHome}
         />
       )}

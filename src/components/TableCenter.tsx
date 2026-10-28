@@ -16,6 +16,86 @@ export interface CleanBannerInfo {
   winningCard: Card;
 }
 
+// Arrange opponents in consistent clockwise seating order relative to local player
+export const getClockwiseOpponents = (allPlayers: Player[], localId: string): Player[] => {
+  const localIndex = allPlayers.findIndex((p) => p.id === localId);
+  if (localIndex === -1) {
+    return allPlayers.filter((p) => p.id !== localId);
+  }
+  const n = allPlayers.length;
+  const ordered: Player[] = [];
+  for (let step = 1; step < n; step++) {
+    const opp = allPlayers[(localIndex + step) % n];
+    if (opp && opp.id !== localId) {
+      ordered.push(opp);
+    }
+  }
+  return ordered;
+};
+
+export interface CardTablePosition {
+  leftPct: number;
+  topPct: number;
+  rotationDeg: number;
+  left: string;
+  top: string;
+  transform: string;
+}
+
+// Shared position in the MIDDLE of table with same radial layout and player facing
+export const getCardTablePosition = (
+  playerId: string,
+  localPlayerId: string,
+  players: Player[]
+): CardTablePosition => {
+  if (!localPlayerId || playerId === localPlayerId) {
+    return {
+      leftPct: 50,
+      topPct: 56,
+      rotationDeg: 0,
+      left: '50%',
+      top: '56%',
+      transform: 'translate(-50%, -50%) rotate(0deg)',
+    };
+  }
+
+  const opponents = getClockwiseOpponents(players, localPlayerId);
+  const oppIndex = opponents.findIndex((p) => p.id === playerId);
+  if (oppIndex === -1) {
+    return {
+      leftPct: 50,
+      topPct: 50,
+      rotationDeg: 0,
+      left: '50%',
+      top: '50%',
+      transform: 'translate(-50%, -50%)',
+    };
+  }
+
+  const count = opponents.length;
+  const arcStart = 205;
+  const arcEnd = -25;
+  const step = count > 1 ? (arcStart - arcEnd) / (count - 1) : 0;
+  const oppAngleDeg = count === 1 ? 90 : arcStart - oppIndex * step;
+  const oppAngleRad = (oppAngleDeg * Math.PI) / 180;
+
+  // Compact middle of table felt
+  const cardRadiusX = count >= 6 ? 12 : 11;
+  const cardRadiusY = count >= 6 ? 9.5 : 8.5;
+  const leftPct = 50 + cardRadiusX * Math.cos(oppAngleRad);
+  const topPct = 50 - cardRadiusY * Math.sin(oppAngleRad);
+  const rotationDeg = -(oppAngleDeg - 90);
+
+  return {
+    leftPct,
+    topPct,
+    rotationDeg,
+    left: `${leftPct}%`,
+    top: `${topPct}%`,
+    transform: `translate(-50%, -50%) rotate(${rotationDeg}deg)`,
+  };
+};
+
 interface TableCenterProps {
   trick: Trick;
   deadPile?: Card[];
@@ -30,6 +110,7 @@ interface TableCenterProps {
   cleanBanner?: CleanBannerInfo | null;
   isDiscarding?: boolean;
   flyingCardIds?: Set<string>;
+  localPlayerId?: string;
 }
 
 export const TableCenter: React.FC<TableCenterProps> = ({
@@ -39,84 +120,69 @@ export const TableCenter: React.FC<TableCenterProps> = ({
   manualPickupRequired = false,
   onManualPickup,
   pickerName,
-  cleanBanner,
   isDiscarding = false,
   flyingCardIds,
+  localPlayerId = '',
 }) => {
-  const getPlayer = (id: string) => players.find((p) => p.id === id);
-
   // Cards currently flying in the air MUST NOT be rendered on the table felt prematurely
   const visiblePlays = flyingCardIds && flyingCardIds.size > 0
     ? trick.plays.filter((p) => !flyingCardIds.has(p.card.id))
     : trick.plays;
 
   return (
-    <div className="relative flex flex-col items-center justify-center w-full h-full min-h-[180px] sm:min-h-[250px] pointer-events-auto">
-      {/* Clean Trick Winner Banner */}
-      {cleanBanner && (
-        <div className="absolute -top-4 z-40 px-4 py-1.5 rounded-full bg-emerald-950/95 border border-emerald-400/70 shadow-2xl backdrop-blur-md flex items-center gap-2 animate-bounce text-emerald-200 text-xs sm:text-sm font-black">
-          <span>✨</span>
-          <span>{cleanBanner.winnerName} takes the trick!</span>
+    <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+      {/* Center Subtle Felt Ornament (when table is empty) */}
+      {visiblePlays.length === 0 && (
+        <div className="flex flex-col items-center justify-center opacity-20 select-none pointer-events-none">
+          <div className="w-10 h-10 rounded-full border border-dashed border-white/30 flex items-center justify-center">
+            <Sparkles className="w-4 h-4 text-amber-300/80 animate-pulse" />
+          </div>
         </div>
       )}
 
-      {/* Center Trick Played Cards Fan (with Discard Sweep Animation) */}
-      <div className={`relative flex items-center justify-center w-full h-40 ${isDiscarding ? 'animate-discard-sweep' : ''}`}>
-        {visiblePlays.length === 0 ? (
-          <div className="flex flex-col items-center justify-center opacity-30 select-none">
-            <div className="w-10 h-10 rounded-full border border-dashed border-white/25 flex items-center justify-center">
-              <Sparkles className="w-4 h-4 text-amber-300/80 animate-pulse" />
+      {/* Played Cards positioned in MIDDLE of table, radially separated and facing towards each player */}
+      {visiblePlays.map((play, index) => {
+        const layout = getCardTablePosition(play.playerId, localPlayerId, players);
+
+        return (
+          <div
+            key={play.card.id}
+            className={`absolute pointer-events-auto transition-all duration-300 flex flex-col items-center ${
+              isDiscarding ? 'animate-discard-sweep' : ''
+            }`}
+            style={{
+              left: layout.left,
+              top: layout.top,
+              transform: layout.transform,
+              zIndex: play.isThulla ? 35 : 15 + index,
+            }}
+          >
+            <div className="relative group">
+              <CardView
+                card={play.card}
+                fourColorSuits={fourColorSuits}
+                scale={0.76}
+                className={`shadow-2xl transition-transform ${
+                  play.isThulla
+                    ? 'ring-4 ring-red-500 ring-offset-2 ring-offset-black scale-105 shadow-[0_0_25px_rgba(239,68,68,0.95)]'
+                    : 'group-hover:scale-105'
+                }`}
+              />
+
+              {/* Thulla indicator badge */}
+              {play.isThulla && (
+                <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-red-600 text-white font-black text-[9px] px-2 py-0.5 rounded-full border border-yellow-300 shadow-xl animate-pulse whitespace-nowrap">
+                  💥 THULLA
+                </div>
+              )}
             </div>
           </div>
-        ) : (
-          <div className="relative flex items-center justify-center">
-            {visiblePlays.map((play, index) => {
-              const player = getPlayer(play.playerId);
-              const total = visiblePlays.length;
-              const angle = total > 1 ? (index - (total - 1) / 2) * 14 : 0;
-              const xOffset = total > 1 ? (index - (total - 1) / 2) * 28 : 0;
-              const yOffset = total > 1 ? Math.abs(index - (total - 1) / 2) * 4 : 0;
-
-              return (
-                <div
-                  key={play.card.id}
-                  className="absolute flex flex-col items-center transition-all duration-300"
-                  style={{
-                    transform: `translateX(${xOffset}px) translateY(${yOffset}px) rotate(${angle}deg)`,
-                    zIndex: play.isThulla ? 30 : index + 10,
-                  }}
-                >
-                  <CardView
-                    card={play.card}
-                    fourColorSuits={fourColorSuits}
-                    scale={0.92}
-                    className={`shadow-2xl ${
-                      play.isThulla
-                        ? 'ring-4 ring-red-500 ring-offset-2 ring-offset-black scale-105 shadow-[0_0_20px_rgba(239,68,68,0.8)]'
-                        : ''
-                    }`}
-                  />
-
-                  {/* Player Name chip */}
-                  <span
-                    className={`mt-1.5 px-2 py-0.5 text-[9px] font-bold rounded-full truncate max-w-[80px] shadow ${
-                      play.isThulla
-                        ? 'bg-gradient-to-r from-red-700 to-amber-600 text-white border border-yellow-300 font-black shadow-lg scale-105'
-                        : 'bg-slate-950/85 border border-white/20 text-white'
-                    }`}
-                  >
-                    {player?.name}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
+        );
+      })}
 
       {/* Manual Pick-up Button Prompt (Only shown when manual pickup setting active) */}
       {manualPickupRequired && onManualPickup && (
-        <div className="absolute z-30 flex flex-col items-center animate-bounce">
+        <div className="absolute z-40 flex flex-col items-center animate-bounce pointer-events-auto">
           <button
             onClick={onManualPickup}
             className="px-5 py-2.5 bg-gradient-to-r from-red-600 to-amber-600 hover:from-red-500 hover:to-amber-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider rounded-xl shadow-2xl border border-yellow-300/60 flex items-center gap-2 cursor-pointer"

@@ -26,6 +26,7 @@ export type NetworkEvent =
       pickerName: string;
       pickedCount: number;
       leadSuit: string | null;
+      highestLeadCard?: Card | null;
     }
   | {
       type: 'CLEAN_TRICK_ALERT';
@@ -58,9 +59,11 @@ export type NetworkEvent =
         isFirstTrick: boolean;
         settings: RoomSettings;
         theme: Theme;
+        bhabhiPlayer?: Player | null;
       };
       targetPlayerId?: string;
       toast?: string;
+      sequenceNumber?: number;
     }
   | { type: 'ROOM_SETTINGS_UPDATE'; settings: RoomSettings; theme?: Theme }
   | { type: 'CHAT_MESSAGE'; message: ChatMessage }
@@ -103,6 +106,10 @@ export type NetworkEvent =
   | {
       type: 'VOICE_READY';
       fromPlayerId: string;
+    }
+  | {
+      type: 'RETURN_TO_LOBBY';
+      requesterId?: string;
     };
 
 function getServerUrl(): string {
@@ -132,6 +139,7 @@ export class MultiplayerService {
   private onConnectCallbacks: Set<() => void> = new Set();
   private pingCallbacks: Set<(ping: number) => void> = new Set();
   private currentPing: number = 25;
+  private smoothedPing: number = 25;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
 
   public getPing(): number {
@@ -214,13 +222,11 @@ export class MultiplayerService {
     this.socket.on('disconnect', (reason) => {
       console.warn(`[Multiplayer] Disconnected from server: ${reason}`);
       this.onConnectionChangeHandler?.(false);
-      this.updatePing(999);
     });
 
     this.socket.on('connect_error', (err) => {
       console.warn(`[Multiplayer] Server connection error:`, err.message);
       this.onConnectionChangeHandler?.(false);
-      this.updatePing(999);
     });
 
     // Authoritative Server Event Listeners
@@ -239,6 +245,7 @@ export class MultiplayerService {
           theme: data.state.theme,
         },
         toast: data.toast,
+        sequenceNumber: data.sequenceNumber,
       });
     });
 
@@ -266,6 +273,7 @@ export class MultiplayerService {
         pickerName: data.pickerName,
         pickedCount: data.pickedCount,
         leadSuit: data.leadSuit,
+        highestLeadCard: data.highestLeadCard,
       });
     });
 
@@ -368,18 +376,20 @@ export class MultiplayerService {
       const startTime = Date.now();
       this.socket.emit('PING_MEASURE', startTime, () => {
         const rtt = Math.max(1, Date.now() - startTime);
-        this.updatePing(rtt);
+        // Exponential Moving Average (EMA) prevents false spikes: 70% smoothed + 30% instant
+        this.smoothedPing = Math.round(0.7 * this.smoothedPing + 0.3 * rtt);
+        this.updatePing(this.smoothedPing);
 
-        // Report ping to server so peers know
+        // Report smoothed ping to server so peers know
         if (this.currentRoomCode && this.localPlayerId) {
           this.socket?.emit('REPORT_PING', {
             roomCode: this.currentRoomCode,
             playerId: this.localPlayerId,
-            ping: rtt,
+            ping: this.smoothedPing,
           });
         }
       });
-    }, 2500);
+    }, 4000);
   }
 
   private updatePing(ping: number) {
@@ -469,12 +479,27 @@ export class MultiplayerService {
         });
         break;
 
+      case 'RETURN_TO_LOBBY':
+        this.socket.emit('RETURN_TO_LOBBY', {
+          roomCode: this.currentRoomCode,
+          playerId: this.localPlayerId,
+        });
+        break;
+
       case 'VOICE_SIGNAL':
       case 'VOICE_STATUS':
       case 'VOICE_READY':
         this.socket.emit(event.type, event);
         break;
     }
+  }
+
+  public returnToLobbyOnServer(ack?: (res: { success: boolean; error?: string }) => void) {
+    if (!this.currentRoomCode || !this.localPlayerId) return;
+    this.socket?.emit('RETURN_TO_LOBBY', {
+      roomCode: this.currentRoomCode,
+      playerId: this.localPlayerId,
+    }, ack);
   }
 
   public createRoomOnServer(
@@ -500,7 +525,7 @@ export class MultiplayerService {
   public joinRoomOnServer(
     roomCode: string,
     player: { id: string; name: string; avatar: string },
-    ack?: (res: { success: boolean; roomCode?: string; state?: any; isReconnecting?: boolean; error?: string }) => void
+    ack?: (res: { success: boolean; roomCode?: string; player?: any; state?: any; isReconnecting?: boolean; error?: string }) => void
   ) {
     this.initSocket();
     this.localPlayerId = player.id;
@@ -514,6 +539,24 @@ export class MultiplayerService {
       roomCode: this.currentRoomCode,
       playerId: this.localPlayerId,
       cardId,
+    }, ack);
+  }
+
+  public addBotOnServer(difficulty: 'easy' | 'medium' | 'hard' = 'medium', ack?: (res: any) => void) {
+    if (!this.currentRoomCode || !this.localPlayerId) return;
+    this.socket?.emit('ADD_BOT', {
+      roomCode: this.currentRoomCode,
+      playerId: this.localPlayerId,
+      difficulty,
+    }, ack);
+  }
+
+  public removePlayerOnServer(targetPlayerId: string, ack?: (res: any) => void) {
+    if (!this.currentRoomCode || !this.localPlayerId) return;
+    this.socket?.emit('REMOVE_PLAYER', {
+      roomCode: this.currentRoomCode,
+      playerId: this.localPlayerId,
+      targetPlayerId,
     }, ack);
   }
 
